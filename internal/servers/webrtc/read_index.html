@@ -1,0 +1,637 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MediaMTX Player</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Syne:wght@600;700&display=swap" rel="stylesheet">
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0a0a0a;--border:rgba(255,255,255,0.08);--dim:rgba(255,255,255,0.32);
+  --mid:rgba(255,255,255,0.62);--text:rgba(255,255,255,0.9);
+  --amber:#f59e0b;--green:#22c55e;--red:#ef4444;
+  --mono:'JetBrains Mono',monospace;--sans:'Syne',sans-serif;
+  --ctrl-h:52px;
+}
+html,body{width:100%;height:100%;background:var(--bg);overflow:hidden;font-family:var(--sans);color:var(--text)}
+#video{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#050505;cursor:none}
+#msg{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;
+  justify-content:center;gap:12px;font-family:var(--mono);font-size:11px;
+  letter-spacing:.12em;color:var(--dim);text-transform:uppercase;pointer-events:none;
+  text-align:center;transition:opacity .3s}
+#msg.hidden{opacity:0}
+.spin{width:18px;height:18px;border:2px solid var(--border);border-top-color:var(--amber);
+  border-radius:50%;animation:_spin .7s linear infinite}
+@keyframes _spin{to{transform:rotate(360deg)}}
+
+/* HUD */
+#hud{position:absolute;top:0;left:0;right:0;display:flex;align-items:stretch;
+  flex-wrap:wrap;
+  background:linear-gradient(180deg,rgba(0,0,0,.85) 0%,transparent 100%);
+  opacity:0;transition:opacity .35s;pointer-events:none;z-index:10}
+#hud.show{opacity:1}
+.hc{padding:9px 12px 7px;font-family:var(--mono);font-size:10px;letter-spacing:.06em;
+  color:var(--dim);border-right:1px solid var(--border);white-space:nowrap;line-height:1;
+  display:flex;align-items:center;gap:0}
+.hc b{color:var(--mid);font-weight:500;margin-left:5px}
+.hc.al b{color:var(--amber)}
+.hc.rtt-cell b{color:#a78bfa}
+#ci{display:flex;align-items:center;gap:6px;padding:9px 14px 7px;
+  font-family:var(--mono);font-size:10px;color:var(--dim);
+  border-right:1px solid var(--border);flex-shrink:0}
+#cd{width:6px;height:6px;border-radius:50%;background:var(--red);
+  box-shadow:0 0 5px var(--red);transition:background .4s,box-shadow .4s;flex-shrink:0}
+#cd.ok{background:var(--green);box-shadow:0 0 7px var(--green)}
+#cd.wait{background:var(--amber);box-shadow:0 0 7px var(--amber);animation:_blink 1s infinite}
+@keyframes _blink{0%,100%{opacity:1}50%{opacity:.28}}
+
+/* Layer Panel */
+#lp{position:absolute;bottom:calc(var(--ctrl-h) + 16px);right:16px;
+  display:flex;flex-direction:column;gap:5px;
+  opacity:0;transition:opacity .35s;pointer-events:none;z-index:10}
+#lp.show{opacity:1;pointer-events:auto}
+#lp.empty{display:none}
+.lb{display:grid;grid-template-columns:52px 1fr;align-items:center;
+  background:rgba(10,10,10,.9);border:1px solid var(--border);border-radius:7px;
+  overflow:hidden;cursor:pointer;transition:border-color .15s,background .15s;
+  backdrop-filter:blur(12px);box-shadow:0 2px 14px rgba(0,0,0,.6);text-align:left}
+.lb:hover{background:rgba(22,22,22,.96);border-color:rgba(255,255,255,.15)}
+.lb.active{border-color:rgba(245,158,11,.5);background:rgba(245,158,11,.07)}
+.lb.abr-active{border-color:rgba(34,197,94,.45);background:rgba(34,197,94,.06)}
+.lbadge{padding:10px 0;text-align:center;font-family:var(--sans);font-size:11px;
+  font-weight:700;letter-spacing:.05em;color:var(--dim);
+  border-right:1px solid var(--border);transition:color .15s}
+.lb.active .lbadge{color:var(--amber)}
+.lb.abr-active .lbadge{color:var(--green)}
+.lmeta{padding:6px 12px;display:flex;flex-direction:column;gap:2px}
+.lmeta .res{font-family:var(--mono);font-size:11px;font-weight:500;color:var(--mid)}
+.lmeta .br{font-family:var(--mono);font-size:9px;color:var(--dim)}
+
+/* ABR button */
+#abr-btn{
+  display:flex;align-items:center;justify-content:space-between;gap:8px;
+  padding:8px 12px 8px 14px;
+  background:rgba(10,10,10,.9);border:1px solid var(--border);border-radius:7px;
+  cursor:pointer;transition:border-color .15s,background .15s;
+  backdrop-filter:blur(12px);box-shadow:0 2px 14px rgba(0,0,0,.6);
+  font-family:var(--mono);font-size:10px;letter-spacing:.06em;color:var(--dim);
+}
+#abr-btn:hover{background:rgba(22,22,22,.96);border-color:rgba(255,255,255,.15)}
+#abr-btn.on{border-color:rgba(34,197,94,.45);background:rgba(34,197,94,.07);color:var(--green);}
+#abr-toggle{
+  width:28px;height:16px;border-radius:8px;background:rgba(255,255,255,.12);
+  position:relative;flex-shrink:0;transition:background .2s;
+}
+#abr-btn.on #abr-toggle{background:var(--green)}
+#abr-thumb{
+  position:absolute;top:2px;left:2px;width:12px;height:12px;
+  border-radius:50%;background:#fff;transition:transform .2s;
+}
+#abr-btn.on #abr-thumb{transform:translateX(12px)}
+
+/* Controls Bar */
+#ctrl{
+  position:absolute;bottom:0;left:0;right:0;height:var(--ctrl-h);
+  display:flex;align-items:center;gap:4px;padding:0 12px;
+  background:linear-gradient(0deg,rgba(0,0,0,.82) 0%,transparent 100%);
+  opacity:0;transition:opacity .35s;pointer-events:none;z-index:10;
+}
+#ctrl.show{opacity:1;pointer-events:auto}
+.cbtn{width:36px;height:36px;border:none;background:rgba(255,255,255,0.06);
+  border-radius:8px;cursor:pointer;display:flex;align-items:center;justify-content:center;
+  color:var(--mid);transition:background .15s,color .15s;flex-shrink:0;outline:none;}
+.cbtn:hover{background:rgba(255,255,255,.12);color:var(--text)}
+.cbtn.active{color:var(--amber)}
+.cbtn svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:2;
+  stroke-linecap:round;stroke-linejoin:round;pointer-events:none}
+#vol-wrap{display:flex;align-items:center;gap:6px;margin-right:4px}
+#vol-slider{-webkit-appearance:none;appearance:none;width:80px;height:3px;
+  border-radius:2px;outline:none;cursor:pointer;
+  background:linear-gradient(to right,var(--amber) 0%,var(--amber) var(--vol,100%),rgba(255,255,255,.2) var(--vol,100%),rgba(255,255,255,.2) 100%);}
+#vol-slider::-webkit-slider-thumb{-webkit-appearance:none;width:13px;height:13px;
+  border-radius:50%;background:var(--text);box-shadow:0 0 4px rgba(0,0,0,.6);cursor:pointer;}
+#vol-slider::-moz-range-thumb{width:13px;height:13px;border-radius:50%;border:none;background:var(--text);cursor:pointer;}
+.cspacer{flex:1}
+#live-badge{font-family:var(--mono);font-size:10px;letter-spacing:.08em;color:var(--dim);
+  padding:4px 9px;border:1px solid var(--border);border-radius:5px;white-space:nowrap;user-select:none;}
+#live-badge.live{color:var(--red);border-color:rgba(239,68,68,.35);background:rgba(239,68,68,.08);}
+
+body.idle #hud,body.idle #ctrl,body.idle #lp{opacity:0;pointer-events:none}
+body.idle #video{cursor:none}
+body:not(.idle) #video{cursor:default}
+</style>
+</head>
+<body>
+<video id="video"></video>
+<div id="msg"><div class="spin"></div><span id="mt">Verbinde...</span></div>
+
+<div id="hud">
+  <div id="ci"><div id="cd" class="wait"></div><span id="ct">Verbinde</span></div>
+  <div class="hc al">LAYER <b id="hl">—</b></div>
+  <div class="hc">RES <b id="hr">—</b></div>
+  <div class="hc">BITRATE <b id="hb">—</b></div>
+  <div class="hc">FPS <b id="hf">—</b></div>
+  <div class="hc">LOSS <b id="hlo">—</b></div>
+  <div class="hc">JITTER <b id="hj">—</b></div>
+  <div class="hc">RTT <b id="hrtt">…</b></div>
+  <div class="hc">LATENCY <b id="hlatency">…</b></div>
+</div>
+
+<div id="lp" class="empty"></div>
+
+<div id="ctrl">
+  <button class="cbtn" id="btn-play" title="Play/Pause">
+    <svg id="ico-play"  viewBox="0 0 24 24"><polygon points="5,3 19,12 5,21" fill="currentColor" stroke="none"/></svg>
+    <svg id="ico-pause" viewBox="0 0 24 24" style="display:none"><rect x="6" y="4" width="4" height="16" fill="currentColor" stroke="none"/><rect x="14" y="4" width="4" height="16" fill="currentColor" stroke="none"/></svg>
+  </button>
+  <div id="vol-wrap">
+    <button class="cbtn" id="btn-mute" title="Mute">
+      <svg id="ico-vol"   viewBox="0 0 24 24"><polygon points="11,5 6,9 2,9 2,15 6,15 11,19" fill="currentColor" stroke="none"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg>
+      <svg id="ico-muted" viewBox="0 0 24 24" style="display:none"><polygon points="11,5 6,9 2,9 2,15 6,15 11,19" fill="currentColor" stroke="none"/><line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/></svg>
+    </button>
+    <input type="range" id="vol-slider" min="0" max="100" value="100">
+  </div>
+  <div class="cspacer"></div>
+  <div id="live-badge">LIVE</div>
+  <div class="cspacer"></div>
+  <button class="cbtn" id="btn-pip" title="Picture-in-Picture">
+    <svg viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><rect x="12" y="11" width="9" height="6" rx="1" fill="currentColor" stroke="none"/></svg>
+  </button>
+  <button class="cbtn" id="btn-fs" title="Fullscreen">
+    <svg id="ico-fs-enter" viewBox="0 0 24 24"><polyline points="15,3 21,3 21,9"/><polyline points="9,21 3,21 3,15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>
+    <svg id="ico-fs-exit"  viewBox="0 0 24 24" style="display:none"><polyline points="4,14 10,14 10,20"/><polyline points="20,10 14,10 14,4"/><line x1="10" y1="14" x2="3" y2="21"/><line x1="21" y1="3" x2="14" y2="10"/></svg>
+  </button>
+</div>
+
+<script>
+'use strict';
+
+// ── URL params ──────────────────────────────────────────────────────
+const P  = new URLSearchParams(window.location.search);
+const pb = (k,d) => { const v=P.get(k); return v==null?d:['1','true','yes'].includes(v.toLowerCase()); };
+
+const video = document.getElementById('video');
+video.muted      = pb('muted', true);
+video.autoplay   = pb('autoplay', true);
+video.playsInline= pb('playsinline', true);
+video.controls   = false;
+
+// ── UI refs ─────────────────────────────────────────────────────────
+const hud  = document.getElementById('hud');
+const msgEl= document.getElementById('msg');
+const mt   = document.getElementById('mt');
+const lp   = document.getElementById('lp');
+const ctrl = document.getElementById('ctrl');
+const cd   = document.getElementById('cd');
+const ct   = document.getElementById('ct');
+
+function setMsg(t){if(!t){msgEl.classList.add('hidden');return;}mt.textContent=t;msgEl.classList.remove('hidden');}
+function setConn(s,l){cd.className='';ct.textContent=l||s;if(s==='ok')cd.classList.add('ok');if(s==='wait')cd.classList.add('wait');}
+function showUI(){
+  hud.classList.add('show');
+  ctrl.classList.add('show');
+}
+
+// ── Idle ────────────────────────────────────────────────────────────
+let idle;
+function resetIdle(){
+  document.body.classList.remove('idle');
+  clearTimeout(idle);
+  idle=setTimeout(()=>{if(!video.paused)document.body.classList.add('idle');},3200);
+}
+['mousemove','touchstart','click','keydown'].forEach(e=>document.addEventListener(e,resetIdle));
+resetIdle();
+
+// ── Play/Pause ──────────────────────────────────────────────────────
+const btnPlay  = document.getElementById('btn-play');
+const icoPlay  = document.getElementById('ico-play');
+const icoPause = document.getElementById('ico-pause');
+function updatePlayIcon(){icoPlay.style.display=video.paused?'':'none';icoPause.style.display=video.paused?'none':'';}
+btnPlay.addEventListener('click',()=>{video.paused?video.play():video.pause();});
+video.addEventListener('play',updatePlayIcon);
+video.addEventListener('pause',updatePlayIcon);
+video.addEventListener('click',()=>{video.paused?video.play():video.pause();});
+
+// ── Volume ──────────────────────────────────────────────────────────
+const btnMute  = document.getElementById('btn-mute');
+const icoVol   = document.getElementById('ico-vol');
+const icoMuted = document.getElementById('ico-muted');
+const volSlider= document.getElementById('vol-slider');
+function updateVolUI(){
+  const m=video.muted||video.volume===0;
+  icoVol.style.display=m?'none':'';icoMuted.style.display=m?'':'none';
+  const pct=m?0:Math.round(video.volume*100);
+  volSlider.value=pct;volSlider.style.setProperty('--vol',pct+'%');
+}
+btnMute.addEventListener('click',()=>{video.muted=!video.muted;if(!video.muted&&video.volume===0)video.volume=1;updateVolUI();});
+volSlider.addEventListener('input',()=>{video.volume=volSlider.value/100;video.muted=video.volume===0;updateVolUI();});
+video.addEventListener('volumechange',updateVolUI);
+
+// ── PiP ─────────────────────────────────────────────────────────────
+const btnPip=document.getElementById('btn-pip');
+btnPip.addEventListener('click',async()=>{try{document.pictureInPictureElement?await document.exitPictureInPicture():await video.requestPictureInPicture();}catch(_){btnPip.style.display='none';}});
+if(!document.pictureInPictureEnabled)btnPip.style.display='none';
+
+// ── Fullscreen ──────────────────────────────────────────────────────
+const btnFs     = document.getElementById('btn-fs');
+const icoFsEnt  = document.getElementById('ico-fs-enter');
+const icoFsExit = document.getElementById('ico-fs-exit');
+function toggleFs(){document.fullscreenElement?document.exitFullscreen():document.documentElement.requestFullscreen().catch(()=>{});}
+btnFs.addEventListener('click',toggleFs);
+document.addEventListener('fullscreenchange',()=>{
+  const fs=!!document.fullscreenElement;
+  icoFsEnt.style.display=fs?'none':'';icoFsExit.style.display=fs?'':'none';btnFs.classList.toggle('active',fs);
+});
+
+// ── Live badge ──────────────────────────────────────────────────────
+const liveBadge=document.getElementById('live-badge');
+setInterval(()=>liveBadge.classList.toggle('live',!video.paused&&video.readyState>=3),2000);
+
+// ── Keyboard ────────────────────────────────────────────────────────
+document.addEventListener('keydown',e=>{
+  if(e.target.tagName==='INPUT')return;
+  if(e.key===' '){e.preventDefault();video.paused?video.play():video.pause();}
+  if(e.key==='m'||e.key==='M'){video.muted=!video.muted;if(!video.muted&&video.volume===0)video.volume=1;updateVolUI();}
+  if(e.key==='f'||e.key==='F')toggleFs();
+  if(e.key==='ArrowUp'  ){e.preventDefault();video.volume=Math.min(1,video.volume+.1);video.muted=false;updateVolUI();}
+  if(e.key==='ArrowDown'){e.preventDefault();video.volume=Math.max(0,video.volume-.1);updateVolUI();}
+});
+
+// ── RTT via HTTP ping (reliable fallback for receive-only WebRTC) ──
+// Pings the mediamtx API endpoint — same host, minimal payload.
+// Also collects ICE RTT from WebRTC stats as secondary source.
+const RTTMeasure = {
+  value: 0,
+  source: '—',
+  _alpha: 0.2,
+  _timer: null,
+
+  start() {
+    this._tick();
+    this._timer = setInterval(() => this._tick(), 2000);
+  },
+  stop() { clearInterval(this._timer); this._timer = null; },
+
+  async _tick() {
+    // Ping the current page (same-origin, always accessible, no CORS)
+    const url = location.href.split('?')[0];
+    const t0 = performance.now();
+    try {
+      await fetch(url, { method: 'GET', cache: 'no-store', signal: AbortSignal.timeout(3000) });
+      this._update(performance.now() - t0, 'http');
+    } catch(_) {}
+  },
+
+  _update(ms, src) {
+    if (this.value === 0) this.value = ms;
+    else this.value = this._alpha * ms + (1 - this._alpha) * this.value;
+    this.source = src;
+    // Update display immediately after every measurement
+    const el = document.getElementById('hrtt');
+    const el2 = document.getElementById('hlatency');
+    if (el) el.textContent = Math.round(this.value) + 'ms';
+    if (el2) el2.textContent = '~' + Math.round(this.value / 2) + 'ms';
+  },
+
+  updateIce(ms) {
+    if (ms > 0 && (this.value === 0 || ms < this.value)) {
+      this._update(ms, 'ice');
+    }
+  }
+};
+function patchMSID(sdp){
+  const lines=sdp.split('\r\n'); const out=[]; let mi=0;
+  for(const l of lines){
+    if(l.startsWith('m=')){mi++;out.push(l);continue;}
+    if(l.startsWith('a=msid:')){
+      const sp=l.indexOf(' ');
+      if(sp>0){out.push(`a=msid:${l.slice(7,sp)}-s${mi}${l.slice(sp)}`);continue;}
+    }
+    out.push(l);
+  }
+  return out.join('\r\n');
+}
+
+// ── API ─────────────────────────────────────────────────────────────
+async function getTrackInfo(path){
+  try{
+    const r=await fetch(`${location.protocol}//${location.hostname}:9997/v3/paths/get/${path}`,{signal:AbortSignal.timeout(2000)});
+    if(!r.ok)return null;
+    const d=await r.json();
+    const vt=(d.tracks2||[]).filter(t=>['AV1','VP9','VP8','H265','H264'].includes(t.codec));
+    return{count:vt.length,labels:vt.map(t=>{const p=t.codecProps||{};return p.width?`${p.width}×${p.height}`:null;})};
+  }catch(_){return null;}
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// ABR ENGINE
+// ═══════════════════════════════════════════════════════════════════
+//
+// Strategy:
+//   - All tracks are active simultaneously (one WHEP connection, all tracks received).
+//   - ABR monitors the CURRENT active track's packet loss and decoded frame rate.
+//   - Switch DOWN  when: loss > LOSS_HIGH  OR fps drops > 20% below expected  (for 3s)
+//   - Switch UP    when: loss < LOSS_LOW   AND fps is stable                  (for 8s)
+//   - Manual override disables ABR until user re-enables it.
+//   - Tracks are assumed sorted best→worst (index 0 = highest quality).
+//
+const ABR = {
+  LOSS_HIGH:  2.5,   // % — switch down above this loss rate
+  LOSS_LOW:   0.5,   // % — switch up only below this loss rate
+  FPS_DROP:   0.75,  // fraction — switch down if fps < expected * this
+  DOWN_HOLD:  3,     // seconds of bad conditions before switching down
+  UP_HOLD:    8,     // seconds of good conditions before trying to switch up
+  enabled:    true,
+  badSince:   null,  // timestamp of first bad sample
+  goodSince:  null,  // timestamp of first good sample (for upgrade)
+
+  reset() { this.badSince=null; this.goodSince=null; },
+  enable()  { this.enabled=true;  this.reset(); },
+  disable() { this.enabled=false; this.reset(); },
+
+  // Returns: 'down' | 'up' | null
+  evaluate(loss, fps, expectedFps, now) {
+    if (!this.enabled) return null;
+
+    const bad = loss > this.LOSS_HIGH || (expectedFps > 0 && fps > 0 && fps < expectedFps * this.FPS_DROP);
+    const good= loss < this.LOSS_LOW  && (expectedFps <= 0 || fps <= 0 || fps >= expectedFps * 0.92);
+
+    if (bad) {
+      this.goodSince = null;
+      if (!this.badSince) this.badSince = now;
+      else if ((now - this.badSince) / 1000 >= this.DOWN_HOLD) { this.badSince = now; return 'down'; }
+    } else {
+      this.badSince = null;
+      if (good) {
+        if (!this.goodSince) this.goodSince = now;
+        else if ((now - this.goodSince) / 1000 >= this.UP_HOLD) { this.goodSince = now; return 'up'; }
+      } else {
+        this.goodSince = null;
+      }
+    }
+    return null;
+  }
+};
+
+// ═══════════════════════════════════════════════════════════════════
+// SIMULCAST PLAYER
+// ═══════════════════════════════════════════════════════════════════
+class SimulcastPlayer {
+  constructor() {
+    this.pc          = null;
+    this.resourceUrl = null;
+    this.videoTracks = []; // {track, label, w, h, fps, expectedFps, br, loss, jit, prev}
+    this.audioTrack  = null;
+    this.activeIdx   = 0;
+    this.statsTimer  = null;
+    this.abrBtn      = null;
+  }
+
+  async connect(whepUrl) {
+    setMsg('Verbinde...'); setConn('wait','Verbinde');
+    const pathName = location.pathname.replace(/\/(index|read|read_index)\.html$/,'').replace(/^\//,'') || 'stream';
+    const info = await getTrackInfo(pathName);
+    const vCount = (info?.count > 0) ? info.count : 3;
+    const apiLabels = info?.labels || [];
+
+    const pc = new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'}],sdpSemantics:'unified-plan'});
+    this.pc = pc;
+    for(let i=0;i<vCount;i++) pc.addTransceiver('video',{direction:'recvonly'});
+    pc.addTransceiver('audio',{direction:'recvonly'});
+
+    let vIdx=0;
+    pc.ontrack=(evt)=>{
+      const {track}=evt;
+      if(track.kind==='audio'){this.audioTrack=track;return;}
+      const idx=vIdx++;
+      const label=apiLabels[idx]||['HIGH','MED','LOW','L4'][idx]||`L${idx+1}`;
+      this.videoTracks.push({track,label,w:0,h:0,fps:0,expectedFps:0,br:0,loss:0,jit:0,rttIce:0,rttRtcp:0,decodeDelay:0,prev:null});
+      track.onunmute=()=>{
+        const s=track.getSettings();
+        if(s.width){this.videoTracks[idx].w=s.width;this.videoTracks[idx].h=s.height;}
+        if(s.frameRate)this.videoTracks[idx].expectedFps=s.frameRate;
+        this._updateBtn(idx);
+      };
+    };
+
+    const offer=await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    await new Promise(res=>{
+      if(pc.iceGatheringState==='complete'){res();return;}
+      const t=setTimeout(res,3000);
+      pc.addEventListener('icegatheringstatechange',()=>{if(pc.iceGatheringState==='complete'){clearTimeout(t);res();}});
+    });
+
+    const resp=await fetch(whepUrl,{method:'POST',headers:{'Content-Type':'application/sdp','Accept':'application/sdp'},body:pc.localDescription.sdp});
+    if(!resp.ok)throw new Error(`WHEP ${resp.status}`);
+    const loc=resp.headers.get('Location');
+    if(loc)this.resourceUrl=new URL(loc,whepUrl).href;
+
+    let answerSdp=await resp.text();
+    answerSdp=patchMSID(answerSdp);
+    await pc.setRemoteDescription({type:'answer',sdp:answerSdp});
+    await new Promise(res=>setTimeout(res,800));
+
+    pc.onconnectionstatechange=()=>{
+      if(pc.connectionState==='connected'){setConn('ok','Verbunden');setMsg('');showUI();}
+      if(pc.connectionState==='failed'||pc.connectionState==='disconnected'){
+        setConn('wait','Getrennt');setTimeout(()=>this._reconnect(whepUrl),3000);
+      }
+    };
+
+    if(!this.videoTracks.length)throw new Error('Keine Video-Tracks');
+    this._buildUI();
+    this._apply(0);
+    setMsg(''); setConn('ok','Verbunden'); showUI();
+    updateVolUI(); updatePlayIcon();
+    this._startStats();
+  }
+
+  // ── Build layer panel + ABR toggle ──────────────────────────────
+  _buildUI() {
+    lp.innerHTML='';
+    if(this.videoTracks.length<=1){lp.classList.add('empty');return;}
+    lp.classList.remove('empty');
+
+    // ABR toggle button (at top of panel)
+    const abrBtn=document.createElement('button');
+    abrBtn.id='abr-btn';
+    abrBtn.className='on';
+    abrBtn.innerHTML=`<span>AUTO</span><div id="abr-toggle"><div id="abr-thumb"></div></div>`;
+    abrBtn.title='Automatische Qualitätswahl (ABR)';
+    abrBtn.addEventListener('click',()=>{
+      if(ABR.enabled){
+        ABR.disable();
+        abrBtn.classList.remove('on');
+        // Lock to currently playing layer
+        this._markActive(this.activeIdx, false);
+      } else {
+        ABR.enable();
+        abrBtn.classList.add('on');
+        this._markActive(this.activeIdx, true);
+      }
+    });
+    lp.appendChild(abrBtn);
+    this.abrBtn=abrBtn;
+
+    // Layer buttons (best→worst)
+    this.videoTracks.forEach((t,i)=>{
+      const btn=document.createElement('button');
+      btn.className='lb'+(i===0?' abr-active':'');
+      btn.dataset.i=i;
+      btn.innerHTML=`<div class="lbadge" id="lb${i}">${t.label}</div>
+        <div class="lmeta"><div class="res" id="rs${i}">—</div><div class="br" id="br${i}">—</div></div>`;
+      btn.addEventListener('click',()=>{
+        // Manual selection → disable ABR
+        ABR.disable();
+        if(this.abrBtn)this.abrBtn.classList.remove('on');
+        this._select(i);
+      });
+      lp.appendChild(btn);
+    });
+    lp.classList.add('show');
+  }
+
+  _markActive(idx, isAbr) {
+    document.querySelectorAll('.lb').forEach(b=>{b.classList.remove('active');b.classList.remove('abr-active');});
+    const btn=document.querySelector(`[data-i="${idx}"]`);
+    if(btn)btn.classList.add(isAbr?'abr-active':'active');
+  }
+
+  _select(idx) {
+    if(idx===this.activeIdx)return;
+    this._apply(idx);
+  }
+
+  _apply(idx) {
+    const t=this.videoTracks[idx];
+    if(!t)return;
+    const ms=new MediaStream([t.track]);
+    if(this.audioTrack)ms.addTrack(this.audioTrack);
+    const wasMuted=video.muted, wasVol=video.volume;
+    video.srcObject=ms;
+    video.muted=wasMuted; video.volume=wasVol;
+    video.play().catch(()=>{});
+    this.activeIdx=idx;
+    this._markActive(idx, ABR.enabled);
+    this._updateHUD();
+  }
+
+  _updateBtn(idx) {
+    const t=this.videoTracks[idx];if(!t)return;
+    const lb=document.getElementById('lb'+idx);
+    const rs=document.getElementById('rs'+idx);
+    const br=document.getElementById('br'+idx);
+    if(lb)lb.textContent=t.label;
+    if(rs&&t.w)rs.textContent=`${t.w}×${t.h}`;
+    if(br)br.textContent=t.br>0?(t.br>=1000?(t.br/1000).toFixed(2)+' Mbps':t.br+' kbps'):(t.track.readyState==='live'?'Aktiv':'—');
+  }
+
+  _startStats() {
+    this.statsTimer=setInterval(async()=>{
+      if(!this.pc||this.pc.connectionState==='closed')return;
+      try{
+        const stats=await this.pc.getStats();
+        const rtpList=[];
+        stats.forEach(r=>{
+          if(r.type==='inbound-rtp'&&r.kind==='video') rtpList.push(r);
+          // Feed ICE RTT into RTTMeasure if available
+          if(r.type==='candidate-pair'&&r.currentRoundTripTime>0)
+            RTTMeasure.updateIce(r.currentRoundTripTime*1000);
+        });
+        // Push current RTT to all tracks
+        this.videoTracks.forEach(t=>{ t.rttIce=RTTMeasure.value; });
+
+        rtpList.forEach((r,i)=>{
+          let idx=this.videoTracks.findIndex(t=>t.track.id===r.trackIdentifier);
+          if(idx<0)idx=i;
+          const t=this.videoTracks[idx];if(!t)return;
+
+          if(t.prev){
+            const dt=(r.timestamp-t.prev.timestamp)/1000;
+            if(dt>0){
+              t.br=Math.round((r.bytesReceived-t.prev.br)*8/dt/1000);
+              const dp=(r.packetsReceived||0)-(t.prev.pr||0);
+              const dl=(r.packetsLost||0)-(t.prev.pl||0);
+              t.loss=dp+dl>0?((dl/(dp+dl))*100):0;
+            }
+          }
+          if(r.frameWidth>0){t.w=r.frameWidth;t.h=r.frameHeight;}
+          if(r.framesPerSecond!=null)t.fps=r.framesPerSecond;
+          t.jit=r.jitter!=null?r.jitter*1000:0;
+          // Decode delay: ms per frame (totalProcessingDelay is in seconds)
+          if(r.totalProcessingDelay!=null&&r.framesDecoded>0)
+            t.decodeDelay=(r.totalProcessingDelay/r.framesDecoded)*1000;
+          t.prev={timestamp:r.timestamp,br:r.bytesReceived,pr:r.packetsReceived||0,pl:r.packetsLost||0};
+          this._updateBtn(idx);
+        });
+
+        // ── ABR decision ──────────────────────────────────────────
+        const active=this.videoTracks[this.activeIdx];
+        if(active){
+          const decision=ABR.evaluate(active.loss, active.fps, active.expectedFps, Date.now());
+          if(decision==='down' && this.activeIdx < this.videoTracks.length-1){
+            console.log(`[ABR] switching down: loss=${active.loss.toFixed(1)}% fps=${active.fps.toFixed(1)}`);
+            this._apply(this.activeIdx+1);
+          } else if(decision==='up' && this.activeIdx > 0){
+            console.log(`[ABR] switching up to idx ${this.activeIdx-1}`);
+            this._apply(this.activeIdx-1);
+          }
+        }
+      }catch(_){}
+      this._updateHUD();
+    },1000);
+  }
+
+  _updateHUD(){
+    const t=this.videoTracks[this.activeIdx];if(!t)return;
+    const abrTag = ABR.enabled ? ' (ABR)' : '';
+    document.getElementById('hl').textContent=t.label+abrTag;
+    document.getElementById('hr').textContent=t.w?`${t.w}×${t.h}`:'—';
+    document.getElementById('hb').textContent=t.br>0?(t.br>=1000?(t.br/1000).toFixed(2)+' Mbps':t.br+' kbps'):'—';
+    document.getElementById('hf').textContent=t.fps>0?t.fps.toFixed(1)+'fps':'—';
+    document.getElementById('hlo').textContent=t.loss.toFixed(1)+'%';
+    document.getElementById('hj').textContent=t.jit.toFixed(1)+'ms';
+    const rtt = RTTMeasure.value;
+    if (rtt > 0) {
+      document.getElementById('hrtt').textContent = Math.round(rtt) + 'ms (' + RTTMeasure.source + ')';
+      document.getElementById('hlatency').textContent = '~' + Math.round(rtt/2 + (t.decodeDelay||0)) + 'ms';
+    } else {
+      document.getElementById('hrtt').textContent = '…';
+      document.getElementById('hlatency').textContent = '…';
+    }
+  }
+
+  async _reconnect(url){
+    if(this.statsTimer)clearInterval(this.statsTimer);
+    RTTMeasure.stop();
+    if(this.pc){this.pc.close();this.pc=null;}
+    if(this.resourceUrl){fetch(this.resourceUrl,{method:'DELETE'}).catch(()=>{});this.resourceUrl=null;}
+    this.videoTracks=[];this.audioTrack=null;ABR.reset();
+    lp.innerHTML='';lp.classList.add('empty');
+    try{await this.connect(url);}catch(e){setMsg('Fehler: '+e.message);setTimeout(()=>this._reconnect(url),5000);}
+  }
+
+  close(){
+    if(this.statsTimer)clearInterval(this.statsTimer);
+    RTTMeasure.stop();
+    if(this.resourceUrl)fetch(this.resourceUrl,{method:'DELETE'}).catch(()=>{});
+    if(this.pc)this.pc.close();
+  }
+}
+
+// ── Bootstrap ───────────────────────────────────────────────────────
+let player=null;
+window.addEventListener('load',async()=>{
+  RTTMeasure.start();
+  const whepUrl=new URL('whep',window.location.href).href+window.location.search;
+  player=new SimulcastPlayer();
+  try{await player.connect(whepUrl);}
+  catch(e){setMsg('Fehler: '+e.message);setTimeout(()=>window.location.reload(),5000);}
+});
+window.addEventListener('beforeunload',()=>player?.close());
+</script>
+</body>
+</html>
