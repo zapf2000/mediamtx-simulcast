@@ -25,3 +25,20 @@ go build -o mediamtx-simulcast ./
 - ABR auto-switching (packet loss + FPS based)
 - RTT and estimated one-way latency in HUD
 - Volume, mute, fullscreen, PiP controls
+
+## v2: AV1, H265, VP9 Simulcast Support
+
+Apply v2 patch after v1:
+```bash
+python3 contrib/patch_simulcast_v2.py
+go generate ./...
+go build -o mediamtx-simulcast ./
+```
+
+**Supported simulcast codecs:**
+- H264 — OBS 30+
+- H265 — OBS 31+
+- AV1  — OBS 31+ with SVT-AV1
+- VP9  — GStreamer/FFmpeg
+
+Codec is auto-detected — no config needed.
