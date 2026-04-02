@@ -174,7 +174,7 @@ const pb = (k,d) => { const v=P.get(k); return v==null?d:['1','true','yes'].incl
 
 const video = document.getElementById('video');
 video.muted      = pb('muted', true);
-video.autoplay   = pb('autoplay', true);
+video.autoplay   = false; // connect only on play button press
 video.playsInline= pb('playsinline', true);
 video.controls   = false;
 
@@ -209,10 +209,9 @@ const btnPlay  = document.getElementById('btn-play');
 const icoPlay  = document.getElementById('ico-play');
 const icoPause = document.getElementById('ico-pause');
 function updatePlayIcon(){icoPlay.style.display=video.paused?'':'none';icoPause.style.display=video.paused?'none':'';}
-btnPlay.addEventListener('click',()=>{video.paused?video.play():video.pause();});
+// play/pause and connect logic is handled in the load event listener below
 video.addEventListener('play',updatePlayIcon);
 video.addEventListener('pause',updatePlayIcon);
-video.addEventListener('click',()=>{video.paused?video.play():video.pause();});
 
 // ── Volume ──────────────────────────────────────────────────────────
 const btnMute  = document.getElementById('btn-mute');
@@ -252,7 +251,7 @@ setInterval(()=>liveBadge.classList.toggle('live',!video.paused&&video.readyStat
 // ── Keyboard ────────────────────────────────────────────────────────
 document.addEventListener('keydown',e=>{
   if(e.target.tagName==='INPUT')return;
-  if(e.key===' '){e.preventDefault();video.paused?video.play():video.pause();}
+  if(e.key===' '){e.preventDefault(); /* connect logic handled in load handler */}
   if(e.key==='m'||e.key==='M'){video.muted=!video.muted;if(!video.muted&&video.volume===0)video.volume=1;updateVolUI();}
   if(e.key==='f'||e.key==='F')toggleFs();
   if(e.key==='ArrowUp'  ){e.preventDefault();video.volume=Math.min(1,video.volume+.1);video.muted=false;updateVolUI();}
@@ -301,23 +300,59 @@ const RTTMeasure = {
     }
   }
 };
-function patchMSID(sdp){
-  const lines=sdp.split('\r\n'); const out=[]; let mi=0;
-  for(const l of lines){
-    if(l.startsWith('m=')){mi++;out.push(l);continue;}
-    if(l.startsWith('a=msid:')){
-      const sp=l.indexOf(' ');
-      if(sp>0){out.push(`a=msid:${l.slice(7,sp)}-s${mi}${l.slice(sp)}`);continue;}
+function patchMSID(sdp) {
+  const eol = sdp.includes('\r\n') ? '\r\n' : '\n';
+  const lines = sdp.split(eol);
+  const out = [];
+  let mi = 0;
+
+  // First pass: build mapping of original msid values → unique replacements per m= section
+  const msidMap = new Map(); // "origStream origTrack" → {stream, track}
+  let curMi = 0;
+  for (const l of lines) {
+    if (l.startsWith('m=')) { curMi++; continue; }
+    const m = l.match(/^a=msid:(\S+)\s+(\S+)/);
+    if (m) {
+      const key = m[1] + ' ' + m[2] + '@' + curMi;
+      if (!msidMap.has(key)) {
+        msidMap.set(key, { stream: m[1] + '-m' + curMi, track: m[2] + '-m' + curMi });
+      }
     }
+  }
+
+  // Second pass: replace ALL occurrences of msid values (a=msid: and a=ssrc: msid:)
+  for (const l of lines) {
+    if (l.startsWith('m=')) { mi++; out.push(l); continue; }
+
+    // a=msid:<stream> <track>
+    let ml = l.match(/^(a=msid:)(\S+)\s+(\S+)/);
+    if (ml) {
+      const key = ml[2] + ' ' + ml[3] + '@' + mi;
+      const rep = msidMap.get(key) || { stream: ml[2] + '-m' + mi, track: ml[3] + '-m' + mi };
+      out.push(`a=msid:${rep.stream} ${rep.track}`);
+      continue;
+    }
+
+    // a=ssrc:<ssrc> msid:<stream> <track>
+    let sl = l.match(/^(a=ssrc:\d+ msid:)(\S+)\s+(\S+)/);
+    if (sl) {
+      const key = sl[2] + ' ' + sl[3] + '@' + mi;
+      const rep = msidMap.get(key) || { stream: sl[2] + '-m' + mi, track: sl[3] + '-m' + mi };
+      out.push(`${sl[1]}${rep.stream} ${rep.track}`);
+      continue;
+    }
+
     out.push(l);
   }
-  return out.join('\r\n');
+  return out.join(eol);
 }
 
 // ── API ─────────────────────────────────────────────────────────────
 async function getTrackInfo(path){
+  // API is HTTP-only (port 9997). Skip if page is loaded over HTTPS (mixed content blocked).
+  if(location.protocol === 'https:') return null;
   try{
-    const r=await fetch(`${location.protocol}//${location.hostname}:9997/v3/paths/get/${path}`,{signal:AbortSignal.timeout(2000)});
+    const r=await fetch(`http://${location.hostname}:9997/v3/paths/get/${path}`,{signal:AbortSignal.timeout(2000)});
     if(!r.ok)return null;
     const d=await r.json();
     const vt=(d.tracks2||[]).filter(t=>['AV1','VP9','VP8','H265','H264'].includes(t.codec));
@@ -385,11 +420,15 @@ class SimulcastPlayer {
     this.videoTracks = []; // {track, label, w, h, fps, expectedFps, br, loss, jit, prev}
     this.audioTrack  = null;
     this.activeIdx   = 0;
-    this.statsTimer  = null;
-    this.abrBtn      = null;
+    this.statsTimer      = null;
+    this.abrBtn          = null;
+    this.whepUrl         = null;
+    this.mode            = 'abr';
+    this._reconnectTimer = null; // cancel pending reconnects
   }
 
   async connect(whepUrl) {
+    this.whepUrl = whepUrl;
     setMsg('Verbinde...'); setConn('wait','Verbinde');
     const pathName = location.pathname.replace(/\/(index|read|read_index)\.html$/,'').replace(/^\//,'') || 'stream';
     const info = await getTrackInfo(pathName);
@@ -427,7 +466,11 @@ class SimulcastPlayer {
     const resp=await fetch(whepUrl,{method:'POST',headers:{'Content-Type':'application/sdp','Accept':'application/sdp'},body:pc.localDescription.sdp});
     if(!resp.ok)throw new Error(`WHEP ${resp.status}`);
     const loc=resp.headers.get('Location');
-    if(loc)this.resourceUrl=new URL(loc,whepUrl).href;
+    if(loc){
+      const resUrl=new URL(loc,whepUrl);
+      resUrl.search='';
+      this.resourceUrl=resUrl.href;
+    }
 
     let answerSdp=await resp.text();
     answerSdp=patchMSID(answerSdp);
@@ -437,7 +480,8 @@ class SimulcastPlayer {
     pc.onconnectionstatechange=()=>{
       if(pc.connectionState==='connected'){setConn('ok','Verbunden');setMsg('');showUI();}
       if(pc.connectionState==='failed'||pc.connectionState==='disconnected'){
-        setConn('wait','Getrennt');setTimeout(()=>this._reconnect(whepUrl),3000);
+        setConn('wait','Getrennt');
+        if(this.mode==='abr') this._reconnectTimer=setTimeout(()=>this._reconnect(whepUrl),3000);
       }
     };
 
@@ -463,14 +507,17 @@ class SimulcastPlayer {
     abrBtn.title='Automatische Qualitätswahl (ABR)';
     abrBtn.addEventListener('click',()=>{
       if(ABR.enabled){
+        // Disable ABR — user will select manually next
         ABR.disable();
         abrBtn.classList.remove('on');
-        // Lock to currently playing layer
         this._markActive(this.activeIdx, false);
       } else {
+        // Re-enable ABR — reconnect with all tracks
         ABR.enable();
         abrBtn.classList.add('on');
-        this._markActive(this.activeIdx, true);
+        this.mode = 'abr';
+        // Reconnect with all tracks (no ?layer param)
+        this._reconnect(this.whepUrl);
       }
     });
     lp.appendChild(abrBtn);
@@ -484,7 +531,7 @@ class SimulcastPlayer {
       btn.innerHTML=`<div class="lbadge" id="lb${i}">${t.label}</div>
         <div class="lmeta"><div class="res" id="rs${i}">—</div><div class="br" id="br${i}">—</div></div>`;
       btn.addEventListener('click',()=>{
-        // Manual selection → disable ABR
+        // Manual selection → disable ABR, reconnect single-track
         ABR.disable();
         if(this.abrBtn)this.abrBtn.classList.remove('on');
         this._select(i);
@@ -500,9 +547,123 @@ class SimulcastPlayer {
     if(btn)btn.classList.add(isAbr?'abr-active':'active');
   }
 
-  _select(idx) {
-    if(idx===this.activeIdx)return;
-    this._apply(idx);
+  // Manual layer selection: reconnect with single track to save bandwidth
+  async _select(idx) {
+    if(idx===this.activeIdx && this.mode==='manual') return;
+    if(this._selecting) return; // prevent concurrent selects
+    this._selecting = true;
+
+    this.mode = 'manual';
+    setConn('wait', 'Wechsle...');
+
+    // Cancel any pending reconnect + close current connection
+    clearTimeout(this._reconnectTimer);this._reconnectTimer=null;
+    if(this.statsTimer){clearInterval(this.statsTimer);this.statsTimer=null;}
+    if(this.pc){this.pc.onconnectionstatechange=null;this.pc.close();this.pc=null;}
+    if(this.resourceUrl){fetch(this.resourceUrl,{method:'DELETE'}).catch(()=>{});this.resourceUrl=null;}
+
+    // Rebuild track metadata from existing tracks (keep labels/resolution info)
+    const savedTracks = this.videoTracks.map(t=>(t ? {
+      label:t.label, w:t.w, h:t.h
+    } : {label:'',w:0,h:0}));
+    this.videoTracks=[];this.audioTrack=null;
+
+    // Connect with ?layer=N — server sends only that track
+    const layerUrl = this._layerUrl(idx);
+    try {
+      await this._connectSingle(layerUrl, idx, savedTracks);
+      // Cancel any reconnect timer set during pc.close()
+      clearTimeout(this._reconnectTimer); this._reconnectTimer = null;
+    } catch(e) {
+      setMsg('Layer-Fehler: ' + e.message);
+      setConn('wait', 'Fehler');
+    } finally {
+      this._selecting = false;
+    }
+
+  }
+  // Build WHEP URL with layer parameter
+  _layerUrl(idx) {
+    const u = new URL(this.whepUrl);
+    u.searchParams.set('layer', idx);
+    return u.href;
+  }
+
+  // Open a single-track WHEP connection for manual layer selection
+  async _connectSingle(layerUrl, targetIdx, savedTracks) {
+    const pc = new RTCPeerConnection({
+      iceServers:[{urls:'stun:stun.l.google.com:19302'}],
+      sdpSemantics:'unified-plan'
+    });
+    this.pc = pc;
+    pc.addTransceiver('video',{direction:'recvonly'});
+    pc.addTransceiver('audio',{direction:'recvonly'});
+
+    let videoGot=false;
+    pc.ontrack=(evt)=>{
+      const {track}=evt;
+      if(track.kind==='audio'){this.audioTrack=track;return;}
+      if(videoGot) return;
+      videoGot=true;
+      // Restore metadata from saved tracks
+      const saved = savedTracks[targetIdx]||{};
+      const entry={track, label:saved.label||`L${targetIdx+1}`,
+        w:saved.w||0, h:saved.h||0, fps:0, expectedFps:0,
+        br:0, loss:0, jit:0, rttIce:0, rttRtcp:0, decodeDelay:0, prev:null};
+      // Place at targetIdx to keep stats alignment
+      this.videoTracks[targetIdx]=entry;
+      track.onunmute=()=>{
+        const s=track.getSettings();
+        if(s.width){entry.w=s.width;entry.h=s.height;}
+        if(s.frameRate)entry.expectedFps=s.frameRate;
+      };
+    };
+
+    const offer=await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    await new Promise(res=>{
+      if(pc.iceGatheringState==='complete'){res();return;}
+      const t=setTimeout(res,3000);
+      pc.addEventListener('icegatheringstatechange',()=>{if(pc.iceGatheringState==='complete'){clearTimeout(t);res();}});
+    });
+
+    const resp=await fetch(layerUrl,{method:'POST',
+      headers:{'Content-Type':'application/sdp','Accept':'application/sdp'},
+      body:pc.localDescription.sdp});
+    if(!resp.ok) throw new Error(`WHEP ${resp.status}`);
+    const loc=resp.headers.get('Location');
+    if(loc){
+      // Strip query params from resource URL - mediamtx doesn't accept them on DELETE
+      const resUrl = new URL(loc, layerUrl);
+      resUrl.search = '';
+      this.resourceUrl = resUrl.href;
+    }
+
+    // Set handler BEFORE setRemoteDescription
+    pc.onconnectionstatechange=()=>{
+      if(pc.connectionState==="connected"){setConn("ok","Manuell: Layer "+targetIdx);setMsg("");showUI();}
+      if(pc.connectionState==="failed"||pc.connectionState==="disconnected"){setConn("wait","Getrennt");setMsg("▶ Play drücken");}
+    };
+
+    let sdp=await resp.text();
+    sdp=patchMSID(sdp);
+    await pc.setRemoteDescription({type:"answer",sdp});
+    await new Promise(res=>setTimeout(res,500));
+    this.activeIdx=targetIdx;
+    this._markActive(targetIdx, false);
+
+    // Apply: show selected track
+    const t=this.videoTracks[targetIdx];
+    if(t){
+      const ms=new MediaStream([t.track]);
+      if(this.audioTrack)ms.addTrack(this.audioTrack);
+      const wasMuted=video.muted,wasVol=video.volume;
+      video.srcObject=ms; video.muted=wasMuted; video.volume=wasVol;
+      video.play().catch(()=>{});
+    }
+    setMsg('');setConn('ok',`Manuell: Layer ${targetIdx}`);showUI();
+    this._startStats();
+    this._updateHUD();
   }
 
   _apply(idx) {
@@ -545,8 +706,8 @@ class SimulcastPlayer {
         this.videoTracks.forEach(t=>{ t.rttIce=RTTMeasure.value; });
 
         rtpList.forEach((r,i)=>{
-          let idx=this.videoTracks.findIndex(t=>t.track.id===r.trackIdentifier);
-          if(idx<0)idx=i;
+          let idx=this.videoTracks.findIndex(t=>t&&t.track&&t.track.id===r.trackIdentifier);
+          if(idx<0)idx=this.activeIdx; // fallback: use active track
           const t=this.videoTracks[idx];if(!t)return;
 
           if(t.prev){
@@ -604,14 +765,31 @@ class SimulcastPlayer {
     }
   }
 
+  // Pause: close WHEP connection entirely to stop receiving RTP
+  _pauseAndClose() {
+    clearTimeout(this._reconnectTimer);this._reconnectTimer=null;
+    if(this.statsTimer){clearInterval(this.statsTimer);this.statsTimer=null;}
+    if(this.pc){this.pc.onconnectionstatechange=null;this.pc.close();this.pc=null;}
+    if(this.resourceUrl){fetch(this.resourceUrl,{method:'DELETE'}).catch(()=>{});this.resourceUrl=null;}
+    video.pause();
+    video.srcObject=null;
+    hud.classList.remove('show');
+    ctrl.classList.add('show'); // keep controls visible so user can press play again
+    setMsg('▶ Play drücken');
+    msgEl.classList.remove('hidden');
+    setConn('wait','Getrennt');
+    updatePlayIcon();
+  }
+
   async _reconnect(url){
+    clearTimeout(this._reconnectTimer);this._reconnectTimer=null;
     if(this.statsTimer)clearInterval(this.statsTimer);
     RTTMeasure.stop();
-    if(this.pc){this.pc.close();this.pc=null;}
+    if(this.pc){this.pc.onconnectionstatechange=null;this.pc.close();this.pc=null;}
     if(this.resourceUrl){fetch(this.resourceUrl,{method:'DELETE'}).catch(()=>{});this.resourceUrl=null;}
-    this.videoTracks=[];this.audioTrack=null;ABR.reset();
+    this.videoTracks=[];this.audioTrack=null;this.mode='abr';ABR.reset();
     lp.innerHTML='';lp.classList.add('empty');
-    try{await this.connect(url);}catch(e){setMsg('Fehler: '+e.message);setTimeout(()=>this._reconnect(url),5000);}
+    try{await this.connect(url||this.whepUrl);}catch(e){setMsg('Fehler: '+e.message);setTimeout(()=>this._reconnect(url||this.whepUrl),5000);}
   }
 
   close(){
@@ -624,14 +802,57 @@ class SimulcastPlayer {
 
 // ── Bootstrap ───────────────────────────────────────────────────────
 let player=null;
-window.addEventListener('load',async()=>{
+window.addEventListener('load', () => {
   RTTMeasure.start();
-  const whepUrl=new URL('whep',window.location.href).href+window.location.search;
-  player=new SimulcastPlayer();
-  try{await player.connect(whepUrl);}
-  catch(e){setMsg('Fehler: '+e.message);setTimeout(()=>window.location.reload(),5000);}
+  const whepUrl = new URL('whep', window.location.href).href + window.location.search;
+  player = new SimulcastPlayer();
+
+  // Show "press play" state — don't connect yet
+  setMsg('▶ Play drücken');
+  updatePlayIcon();
+
+  // Connect only when play is clicked
+  async function startStream() {
+    if (player.whepUrl) return; // already connected
+    try {
+      await player.connect(whepUrl);
+    } catch(e) {
+      setMsg('Fehler: ' + e.message);
+    }
+  }
+
+  // Override play button: connect first, then play
+  btnPlay.addEventListener('click', async () => {
+    if (!player.whepUrl) {
+      // Not connected yet — connect and start
+      setMsg('Verbinde...');
+      await startStream();
+    } else if (video.paused) {
+      // Was paused (connection closed) — reconnect
+      setMsg('Verbinde...');
+      await player._reconnect(player.whepUrl);
+    } else {
+      // Playing — pause and close connection to save bandwidth
+      player._pauseAndClose();
+    }
+  }, { capture: true }); // capture to override the existing listener
+
+  // Video click also triggers connect
+  video.addEventListener('click', async () => {
+    if (!player.whepUrl) {
+      await startStream();
+    }
+  }, { capture: true });
+
+  // Space bar
+  document.addEventListener('keydown', async (e) => {
+    if (e.key === ' ' && !player.whepUrl) {
+      e.preventDefault();
+      await startStream();
+    }
+  }, { capture: true });
 });
-window.addEventListener('beforeunload',()=>player?.close());
+window.addEventListener('beforeunload', () => player?.close());
 </script>
 </body>
 </html>

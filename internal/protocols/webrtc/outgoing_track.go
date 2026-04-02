@@ -86,11 +86,14 @@ func (t *OutgoingTrack) close() {
 
 // WriteRTP writes a RTP packet.
 func (t *OutgoingTrack) WriteRTP(pkt *rtp.Packet) error {
+	if t.rtcpSender == nil { return nil }
 	return t.WriteRTPWithNTP(pkt, time.Now())
 }
 
 // WriteRTPWithNTP writes a RTP packet.
 func (t *OutgoingTrack) WriteRTPWithNTP(pkt *rtp.Packet, ntp time.Time) error {
+	if t.rtcpSender == nil { return nil }
+	// Guard: sender is nil if track was created but not added to PeerConnection
 	// use right SSRC in packet to make rtcpSender work
 	pkt.SSRC = t.ssrc
 

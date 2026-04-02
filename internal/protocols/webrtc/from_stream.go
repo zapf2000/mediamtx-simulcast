@@ -905,17 +905,24 @@ func setupKLVDataChannel(
 }
 
 // FromStream maps a MediaMTX stream to a WebRTC connection
+// layer_select_patched
 func FromStream(
 	desc *description.Session,
 	r *stream.Reader,
 	pc *PeerConnection,
+	layerIndex int,
 ) error {
 	videoTracks, err := setupVideoTracks(desc, r)
 	if err != nil {
 		return err
 	}
 
-	pc.OutgoingTracks = append(pc.OutgoingTracks, videoTracks...)
+	// Layer selection: layerIndex >= 0 = manual (single track), -1 = ABR (all tracks)
+	if layerIndex >= 0 && layerIndex < len(videoTracks) {
+		pc.OutgoingTracks = append(pc.OutgoingTracks, videoTracks[layerIndex])
+	} else {
+		pc.OutgoingTracks = append(pc.OutgoingTracks, videoTracks...)
+	}
 
 	audioTrack, err := setupAudioTrack(desc, r)
 	if err != nil {
