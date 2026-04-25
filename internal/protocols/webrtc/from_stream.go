@@ -9,6 +9,8 @@ import (
 
 	"github.com/bluenviron/gortsplib/v5/pkg/description"
 	"github.com/bluenviron/gortsplib/v5/pkg/format"
+	codecsh264 "github.com/bluenviron/mediacommon/v2/pkg/codecs/h264"
+	codecsh265 "github.com/bluenviron/mediacommon/v2/pkg/codecs/h265"
 	"github.com/bluenviron/gortsplib/v5/pkg/format/rtpav1"
 	"github.com/bluenviron/gortsplib/v5/pkg/format/rtph264"
 	"github.com/bluenviron/gortsplib/v5/pkg/format/rtph265"
@@ -137,7 +139,76 @@ func setupVideoTracks(
 			tracks = append(tracks, track)
 		}
 	}
+	// Sort tracks by resolution descending (highest quality first).
+	// This ensures index 0 is always the best quality — important for
+	// downstream transcoders that pick the first track.
+	tracks = sortTracksByResolution(tracks, desc)
 	return tracks, nil
+}
+
+// sortTracksByResolution sorts OutgoingTracks by video resolution (highest first).
+// Resolution is extracted from H264/H265 SPS or estimated from bandwidth.
+func sortTracksByResolution(tracks []*OutgoingTrack, desc *description.Session) []*OutgoingTrack {
+	if len(tracks) <= 1 {
+		return tracks
+	}
+
+	type trackWithRes struct {
+		track  *OutgoingTrack
+		pixels int
+	}
+
+	weighted := make([]trackWithRes, 0, len(tracks))
+
+	// Build a map: track index → media (by order of appearance)
+	videoMedias := make([]*description.Media, 0)
+	for _, media := range desc.Medias {
+		for _, f := range media.Formats {
+			switch f.(type) {
+			case *format.H264, *format.H265, *format.AV1, *format.VP9:
+				videoMedias = append(videoMedias, media)
+			}
+			break
+		}
+	}
+
+	for i, t := range tracks {
+		pixels := 0
+		if i < len(videoMedias) {
+			media := videoMedias[i]
+			for _, f := range media.Formats {
+				switch v := f.(type) {
+				case *format.H264:
+					if len(v.SPS) > 0 {
+						var sps codecsh264.SPS
+						if err := sps.Unmarshal(v.SPS); err == nil {
+							pixels = sps.Width() * sps.Height()
+						}
+					}
+				case *format.H265:
+					if len(v.SPS) > 0 {
+						var sps codecsh265.SPS
+						if err := sps.Unmarshal(v.SPS); err == nil {
+							pixels = sps.Width() * sps.Height()
+						}
+					}
+				}
+				break
+			}
+		}
+		weighted = append(weighted, trackWithRes{track: t, pixels: pixels})
+	}
+
+	// Stable sort: highest resolution first
+	slices.SortStableFunc(weighted, func(a, b trackWithRes) int {
+		return b.pixels - a.pixels // descending
+	})
+
+	result := make([]*OutgoingTrack, len(weighted))
+	for i, w := range weighted {
+		result[i] = w.track
+	}
+	return result
 }
 
 // buildH264Track builds an OutgoingTrack for an H264 media section.
