@@ -373,11 +373,11 @@ async function getTrackInfo(path){
 //   - Tracks are assumed sorted best→worst (index 0 = highest quality).
 //
 const ABR = {
-  LOSS_HIGH:  2.5,   // % — switch down above this loss rate
-  LOSS_LOW:   0.5,   // % — switch up only below this loss rate
-  FPS_DROP:   0.75,  // fraction — switch down if fps < expected * this
-  DOWN_HOLD:  3,     // seconds of bad conditions before switching down
-  UP_HOLD:    8,     // seconds of good conditions before trying to switch up
+  LOSS_HIGH:  8.0,   // % — switch down only above this loss rate (was 2.5)
+  LOSS_LOW:   1.0,   // % — switch up only below this loss rate (was 0.5)
+  FPS_DROP:   0.5,   // fraction — switch down if fps < expected * this (was 0.75)
+  DOWN_HOLD:  10,    // seconds of bad conditions before switching down (was 3)
+  UP_HOLD:    45,    // seconds of stable conditions before switching up (was 8)
   enabled:    true,
   badSince:   null,  // timestamp of first bad sample
   goodSince:  null,  // timestamp of first good sample (for upgrade)
@@ -390,7 +390,8 @@ const ABR = {
   evaluate(loss, fps, expectedFps, now) {
     if (!this.enabled) return null;
 
-    const bad = loss > this.LOSS_HIGH || (expectedFps > 0 && fps > 0 && fps < expectedFps * this.FPS_DROP);
+    // Only use packet loss for down-switching — FPS drops are too unreliable
+    const bad = loss > this.LOSS_HIGH;
     const good= loss < this.LOSS_LOW  && (expectedFps <= 0 || fps <= 0 || fps >= expectedFps * 0.92);
 
     if (bad) {
@@ -475,7 +476,31 @@ class SimulcastPlayer {
     let answerSdp=await resp.text();
     answerSdp=patchMSID(answerSdp);
     await pc.setRemoteDescription({type:'answer',sdp:answerSdp});
-    await new Promise(res=>setTimeout(res,800));
+    // Wait for tracks + resolution info (up to 2s)
+    await new Promise(res => {
+      const deadline = setTimeout(res, 2000);
+      const checkDone = () => {
+        // Done when all tracks have resolution OR 800ms passed
+        const allResolved = this.videoTracks.length > 0 &&
+          this.videoTracks.every(t => t && t.w > 0);
+        if (allResolved) { clearTimeout(deadline); res(); }
+      };
+      setTimeout(checkDone, 800); // minimum wait
+      // Re-check every 100ms
+      const poll = setInterval(() => { checkDone(); }, 100);
+      setTimeout(() => clearInterval(poll), 2000);
+    });
+
+    // Sort tracks by resolution descending (highest quality first)
+    if (this.videoTracks.length > 1) {
+      this.videoTracks.sort((a, b) => (b.w * b.h) - (a.w * a.h));
+      // Reassign labels based on sorted order
+      const labels = ['HIGH', 'MED', 'LOW', 'L4'];
+      this.videoTracks.forEach((t, i) => {
+        if (t.w) t.label = `${t.w}×${t.h}`;
+        else t.label = labels[i] || `L${i+1}`;
+      });
+    }
 
     pc.onconnectionstatechange=()=>{
       if(pc.connectionState==='connected'){setConn('ok','Verbunden');setMsg('');showUI();}

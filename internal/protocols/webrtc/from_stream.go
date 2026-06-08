@@ -15,7 +15,6 @@ import (
 	"github.com/bluenviron/gortsplib/v5/pkg/format/rtph264"
 	"github.com/bluenviron/gortsplib/v5/pkg/format/rtph265"
 	"github.com/bluenviron/gortsplib/v5/pkg/format/rtplpcm"
-	"github.com/bluenviron/gortsplib/v5/pkg/format/rtpvp8"
 	"github.com/bluenviron/gortsplib/v5/pkg/format/rtpvp9"
 	"github.com/bluenviron/mediacommon/v2/pkg/codecs/g711"
 	"github.com/bluenviron/mediacommon/v2/pkg/codecs/opus"
@@ -31,6 +30,8 @@ const (
 	webrtcPayloadMaxSize = 1188 // 1200 - 12 (RTP header)
 )
 
+func ptrOf[T any](v T) *T { p := new(T); *p = v; return p }
+
 var multichannelOpusSDP = map[int]string{
 	3: "channel_mapping=0,2,1;num_streams=2;coupled_streams=1",
 	4: "channel_mapping=0,1,2,3;num_streams=2;coupled_streams=2",
@@ -43,12 +44,6 @@ var multichannelOpusSDP = map[int]string{
 var errNoSupportedCodecsFrom = errors.New(
 	"the stream doesn't contain any supported codec, which are currently " +
 		"AV1, VP9, VP8, H265, H264, Opus, G722, G711, LPCM")
-
-func ptrOf[T any](v T) *T {
-	p := new(T)
-	*p = v
-	return p
-}
 
 func randUint32() (uint32, error) {
 	var b [4]byte
@@ -70,98 +65,55 @@ func timestampToDuration(t int64, clockRate int) time.Duration {
 }
 
 // simulcast_v2
-// setupVideoTracks returns one OutgoingTrack per video rendition.
-// Supports simulcast for H264, H265, AV1, VP9 — any codec that appears
-// in more than one media section is forwarded as separate tracks.
+// setupVideoTracks returns one OutboundTrack per video rendition.
 func setupVideoTracks(
 	desc *description.Session,
 	r *stream.Reader,
-) ([]*OutgoingTrack, error) {
-	// Count how many media sections exist per codec
+) ([]*OutboundTrack, error) {
 	codecCount := map[string]int{}
 	for _, media := range desc.Medias {
 		for _, f := range media.Formats {
 			switch f.(type) {
-			case *format.H264:
-				codecCount["h264"]++
-			case *format.H265:
-				codecCount["h265"]++
-			case *format.AV1:
-				codecCount["av1"]++
-			case *format.VP9:
-				codecCount["vp9"]++
+			case *format.H264: codecCount["h264"]++
+			case *format.H265: codecCount["h265"]++
+			case *format.AV1:  codecCount["av1"]++
+			case *format.VP9:  codecCount["vp9"]++
 			}
 		}
 	}
-
-	// Find the simulcast codec (most media sections > 1)
-	simulcastCodec := ""
-	simulcastCount := 0
+	simulcastCodec, simulcastCount := "", 0
 	for codec, count := range codecCount {
 		if count > simulcastCount {
 			simulcastCount = count
 			simulcastCodec = codec
 		}
 	}
-
-	// Single track or no simulcast — use original behavior
 	if simulcastCount <= 1 {
-		t, err := setupFirstVideoTrack(desc, r)
-		if err != nil {
-			return nil, err
-		}
-		if t != nil {
-			return []*OutgoingTrack{t}, nil
-		}
+		t, err := setupVideoTrack(desc, r)
+		if err != nil { return nil, err }
+		if t != nil { return []*OutboundTrack{t}, nil }
 		return nil, nil
 	}
-
-	// Simulcast: build one track per media section for the detected codec
-	var tracks []*OutgoingTrack
+	var tracks []*OutboundTrack
 	for _, media := range desc.Medias {
-		var track *OutgoingTrack
-		var err error
-
+		var (track *OutboundTrack; err error)
 		switch simulcastCodec {
-		case "h264":
-			track, err = buildH264Track(media, r)
-		case "h265":
-			track, err = buildH265Track(media, r)
-		case "av1":
-			track, err = buildAV1Track(media, r)
-		case "vp9":
-			track, err = buildVP9Track(media, r)
+		case "h264": track, err = buildH264Track(media, r)
+		case "h265": track, err = buildH265Track(media, r)
+		case "av1":  track, err = buildAV1Track(media, r)
+		case "vp9":  track, err = buildVP9Track(media, r)
 		}
-		if err != nil {
-			return nil, err
-		}
-		if track != nil {
-			tracks = append(tracks, track)
-		}
+		if err != nil { return nil, err }
+		if track != nil { tracks = append(tracks, track) }
 	}
-	// Sort tracks by resolution descending (highest quality first).
-	// This ensures index 0 is always the best quality — important for
-	// downstream transcoders that pick the first track.
-	tracks = sortTracksByResolution(tracks, desc)
-	return tracks, nil
+	return sortTracksByResolution(tracks, desc), nil
 }
 
-// sortTracksByResolution sorts OutgoingTracks by video resolution (highest first).
-// Resolution is extracted from H264/H265 SPS or estimated from bandwidth.
-func sortTracksByResolution(tracks []*OutgoingTrack, desc *description.Session) []*OutgoingTrack {
-	if len(tracks) <= 1 {
-		return tracks
-	}
-
-	type trackWithRes struct {
-		track  *OutgoingTrack
-		pixels int
-	}
-
-	weighted := make([]trackWithRes, 0, len(tracks))
-
-	// Build a map: track index → media (by order of appearance)
-	videoMedias := make([]*description.Media, 0)
+func sortTracksByResolution(tracks []*OutboundTrack, desc *description.Session) []*OutboundTrack {
+	if len(tracks) <= 1 { return tracks }
+	type tw struct{ t *OutboundTrack; px int }
+	var wl []tw
+	videoMedias := []*description.Media{}
 	for _, media := range desc.Medias {
 		for _, f := range media.Formats {
 			switch f.(type) {
@@ -171,92 +123,54 @@ func sortTracksByResolution(tracks []*OutgoingTrack, desc *description.Session) 
 			break
 		}
 	}
-
 	for i, t := range tracks {
-		pixels := 0
+		px := 0
 		if i < len(videoMedias) {
-			media := videoMedias[i]
-			for _, f := range media.Formats {
+			for _, f := range videoMedias[i].Formats {
 				switch v := f.(type) {
 				case *format.H264:
 					if len(v.SPS) > 0 {
-						var sps codecsh264.SPS
-						if err := sps.Unmarshal(v.SPS); err == nil {
-							pixels = sps.Width() * sps.Height()
-						}
+						var s codecsh264.SPS
+						if e := s.Unmarshal(v.SPS); e == nil { px = s.Width() * s.Height() }
 					}
 				case *format.H265:
 					if len(v.SPS) > 0 {
-						var sps codecsh265.SPS
-						if err := sps.Unmarshal(v.SPS); err == nil {
-							pixels = sps.Width() * sps.Height()
-						}
+						var s codecsh265.SPS
+						if e := s.Unmarshal(v.SPS); e == nil { px = s.Width() * s.Height() }
 					}
 				}
 				break
 			}
 		}
-		weighted = append(weighted, trackWithRes{track: t, pixels: pixels})
+		wl = append(wl, tw{t, px})
 	}
-
-	// Stable sort: highest resolution first
-	slices.SortStableFunc(weighted, func(a, b trackWithRes) int {
-		return b.pixels - a.pixels // descending
-	})
-
-	result := make([]*OutgoingTrack, len(weighted))
-	for i, w := range weighted {
-		result[i] = w.track
-	}
-	return result
+	slices.SortStableFunc(wl, func(a, b tw) int { return b.px - a.px })
+	res := make([]*OutboundTrack, len(wl))
+	for i, w := range wl { res[i] = w.t }
+	return res
 }
 
-// buildH264Track builds an OutgoingTrack for an H264 media section.
-func buildH264Track(
-	media *description.Media,
-	r *stream.Reader,
-) (*OutgoingTrack, error) {
+func buildH264Track(media *description.Media, r *stream.Reader) (*OutboundTrack, error) {
 	var h264Format *format.H264
 	for _, f := range media.Formats {
-		if v, ok := f.(*format.H264); ok {
-			h264Format = v
-			break
-		}
+		if v, ok := f.(*format.H264); ok { h264Format = v; break }
 	}
-	if h264Format == nil {
-		return nil, nil
-	}
-
-	track := &OutgoingTrack{
-		Caps: webrtc.RTPCodecCapability{
-			MimeType:    webrtc.MimeTypeH264,
-			ClockRate:   90000,
-			SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
-		},
-	}
-	encoder := &rtph264.Encoder{
-		PayloadType:    96,
-		PayloadMaxSize: webrtcPayloadMaxSize,
-	}
-	if err := encoder.Init(); err != nil {
-		return nil, err
-	}
-	firstReceived := false
-	var lastPTS int64
+	if h264Format == nil { return nil, nil }
+	track := &OutboundTrack{Caps: webrtc.RTPCodecCapability{
+		MimeType: webrtc.MimeTypeH264, ClockRate: 90000,
+		SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
+	}}
+	encoder := &rtph264.Encoder{PayloadType: 96, PayloadMaxSize: webrtcPayloadMaxSize, PacketizationMode: 1}
+	if err := encoder.Init(); err != nil { return nil, err }
+	firstReceived := false; var lastPTS int64
 	r.OnData(media, h264Format, func(u *unit.Unit) error {
-		if u.NilPayload() {
-			return nil
-		}
-		if !firstReceived {
-			firstReceived = true
-		} else if u.PTS < lastPTS {
+		if u.NilPayload() { return nil }
+		if !firstReceived { firstReceived = true } else if u.PTS < lastPTS {
 			return fmt.Errorf("WebRTC doesn't support H264 streams with B-frames")
 		}
 		lastPTS = u.PTS
 		packets, err := encoder.Encode(u.Payload.(unit.PayloadH264))
-		if err != nil {
-			return nil //nolint:nilerr
-		}
+		if err != nil { return nil } //nolint:nilerr
 		for _, pkt := range packets {
 			ntp := u.NTP.Add(timestampToDuration(int64(pkt.Timestamp), 90000))
 			pkt.Timestamp += u.RTPPackets[0].Timestamp
@@ -267,52 +181,27 @@ func buildH264Track(
 	return track, nil
 }
 
-// buildH265Track builds an OutgoingTrack for an H265 media section.
-func buildH265Track(
-	media *description.Media,
-	r *stream.Reader,
-) (*OutgoingTrack, error) {
+func buildH265Track(media *description.Media, r *stream.Reader) (*OutboundTrack, error) {
 	var h265Format *format.H265
 	for _, f := range media.Formats {
-		if v, ok := f.(*format.H265); ok {
-			h265Format = v
-			break
-		}
+		if v, ok := f.(*format.H265); ok { h265Format = v; break }
 	}
-	if h265Format == nil {
-		return nil, nil
-	}
-
-	track := &OutgoingTrack{
-		Caps: webrtc.RTPCodecCapability{
-			MimeType:    webrtc.MimeTypeH265,
-			ClockRate:   90000,
-			SDPFmtpLine: "level-id=93;profile-id=1;tier-flag=0;tx-mode=SRST",
-		},
-	}
-	encoder := &rtph265.Encoder{
-		PayloadType:    96,
-		PayloadMaxSize: webrtcPayloadMaxSize,
-	}
-	if err := encoder.Init(); err != nil {
-		return nil, err
-	}
-	firstReceived := false
-	var lastPTS int64
+	if h265Format == nil { return nil, nil }
+	track := &OutboundTrack{Caps: webrtc.RTPCodecCapability{
+		MimeType: webrtc.MimeTypeH265, ClockRate: 90000,
+		SDPFmtpLine: "level-id=93;profile-id=1;tier-flag=0;tx-mode=SRST",
+	}}
+	encoder := &rtph265.Encoder{PayloadType: 96, PayloadMaxSize: webrtcPayloadMaxSize}
+	if err := encoder.Init(); err != nil { return nil, err }
+	firstReceived := false; var lastPTS int64
 	r.OnData(media, h265Format, func(u *unit.Unit) error {
-		if u.NilPayload() {
-			return nil
-		}
-		if !firstReceived {
-			firstReceived = true
-		} else if u.PTS < lastPTS {
+		if u.NilPayload() { return nil }
+		if !firstReceived { firstReceived = true } else if u.PTS < lastPTS {
 			return fmt.Errorf("WebRTC doesn't support H265 streams with B-frames")
 		}
 		lastPTS = u.PTS
 		packets, err := encoder.Encode(u.Payload.(unit.PayloadH265))
-		if err != nil {
-			return nil //nolint:nilerr
-		}
+		if err != nil { return nil } //nolint:nilerr
 		for _, pkt := range packets {
 			ntp := u.NTP.Add(timestampToDuration(int64(pkt.Timestamp), 90000))
 			pkt.Timestamp += u.RTPPackets[0].Timestamp
@@ -323,43 +212,19 @@ func buildH265Track(
 	return track, nil
 }
 
-// buildAV1Track builds an OutgoingTrack for an AV1 media section.
-func buildAV1Track(
-	media *description.Media,
-	r *stream.Reader,
-) (*OutgoingTrack, error) {
+func buildAV1Track(media *description.Media, r *stream.Reader) (*OutboundTrack, error) {
 	var av1Format *format.AV1
 	for _, f := range media.Formats {
-		if v, ok := f.(*format.AV1); ok {
-			av1Format = v
-			break
-		}
+		if v, ok := f.(*format.AV1); ok { av1Format = v; break }
 	}
-	if av1Format == nil {
-		return nil, nil
-	}
-
-	track := &OutgoingTrack{
-		Caps: webrtc.RTPCodecCapability{
-			MimeType:  webrtc.MimeTypeAV1,
-			ClockRate: 90000,
-		},
-	}
-	encoder := &rtpav1.Encoder{
-		PayloadType:    105,
-		PayloadMaxSize: webrtcPayloadMaxSize,
-	}
-	if err := encoder.Init(); err != nil {
-		return nil, err
-	}
+	if av1Format == nil { return nil, nil }
+	track := &OutboundTrack{Caps: webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeAV1, ClockRate: 90000}}
+	encoder := &rtpav1.Encoder{PayloadType: 105, PayloadMaxSize: webrtcPayloadMaxSize}
+	if err := encoder.Init(); err != nil { return nil, err }
 	r.OnData(media, av1Format, func(u *unit.Unit) error {
-		if u.NilPayload() {
-			return nil
-		}
+		if u.NilPayload() { return nil }
 		packets, err := encoder.Encode(u.Payload.(unit.PayloadAV1))
-		if err != nil {
-			return nil //nolint:nilerr
-		}
+		if err != nil { return nil } //nolint:nilerr
 		for _, pkt := range packets {
 			ntp := u.NTP.Add(timestampToDuration(int64(pkt.Timestamp), 90000))
 			pkt.Timestamp += u.RTPPackets[0].Timestamp
@@ -370,45 +235,21 @@ func buildAV1Track(
 	return track, nil
 }
 
-// buildVP9Track builds an OutgoingTrack for a VP9 media section.
-func buildVP9Track(
-	media *description.Media,
-	r *stream.Reader,
-) (*OutgoingTrack, error) {
+func buildVP9Track(media *description.Media, r *stream.Reader) (*OutboundTrack, error) {
 	var vp9Format *format.VP9
 	for _, f := range media.Formats {
-		if v, ok := f.(*format.VP9); ok {
-			vp9Format = v
-			break
-		}
+		if v, ok := f.(*format.VP9); ok { vp9Format = v; break }
 	}
-	if vp9Format == nil {
-		return nil, nil
-	}
-
-	track := &OutgoingTrack{
-		Caps: webrtc.RTPCodecCapability{
-			MimeType:    webrtc.MimeTypeVP9,
-			ClockRate:   90000,
-			SDPFmtpLine: "profile-id=0",
-		},
-	}
-	encoder := &rtpvp9.Encoder{
-		PayloadType:      96,
-		PayloadMaxSize:   webrtcPayloadMaxSize,
-		InitialPictureID: ptrOf(uint16(8445)),
-	}
-	if err := encoder.Init(); err != nil {
-		return nil, err
-	}
+	if vp9Format == nil { return nil, nil }
+	track := &OutboundTrack{Caps: webrtc.RTPCodecCapability{
+		MimeType: webrtc.MimeTypeVP9, ClockRate: 90000, SDPFmtpLine: "profile-id=0",
+	}}
+	encoder := &rtpvp9.Encoder{PayloadType: 96, PayloadMaxSize: webrtcPayloadMaxSize, InitialPictureID: ptrOf(uint16(8445))}
+	if err := encoder.Init(); err != nil { return nil, err }
 	r.OnData(media, vp9Format, func(u *unit.Unit) error {
-		if u.NilPayload() {
-			return nil
-		}
+		if u.NilPayload() { return nil }
 		packets, err := encoder.Encode(u.Payload.(unit.PayloadVP9))
-		if err != nil {
-			return nil //nolint:nilerr
-		}
+		if err != nil { return nil } //nolint:nilerr
 		for _, pkt := range packets {
 			ntp := u.NTP.Add(timestampToDuration(int64(pkt.Timestamp), 90000))
 			pkt.Timestamp += u.RTPPackets[0].Timestamp
@@ -419,212 +260,21 @@ func buildVP9Track(
 	return track, nil
 }
 
-
-func setupFirstVideoTrack(
+// setupVideoTrack: original single-track behavior (fallback for non-simulcast)
+func setupVideoTrack(
 	desc *description.Session,
 	r *stream.Reader,
-) (*OutgoingTrack, error) {
-	var av1Format *format.AV1
-	media := desc.FindFormat(&av1Format)
-
-	if av1Format != nil { //nolint:dupl
-		track := &OutgoingTrack{
-			Caps: webrtc.RTPCodecCapability{
-				MimeType:  webrtc.MimeTypeAV1,
-				ClockRate: 90000,
-			},
-		}
-
-		encoder := &rtpav1.Encoder{
-			PayloadType:    105,
-			PayloadMaxSize: webrtcPayloadMaxSize,
-		}
-		err := encoder.Init()
-		if err != nil {
-			return nil, err
-		}
-
-		r.OnData(
-			media,
-			av1Format,
-			func(u *unit.Unit) error {
-				if u.NilPayload() {
-					return nil
-				}
-
-				packets, err2 := encoder.Encode(u.Payload.(unit.PayloadAV1))
-				if err2 != nil {
-					return nil //nolint:nilerr
-				}
-
-				for _, pkt := range packets {
-					ntp := u.NTP.Add(timestampToDuration(int64(pkt.Timestamp), 90000))
-					pkt.Timestamp += u.RTPPackets[0].Timestamp
-					track.WriteRTPWithNTP(pkt, ntp) //nolint:errcheck
-				}
-
-				return nil
-			})
-
-		return track, nil
-	}
-
-	var vp9Format *format.VP9
-	media = desc.FindFormat(&vp9Format)
-
-	if vp9Format != nil {
-		track := &OutgoingTrack{
-			Caps: webrtc.RTPCodecCapability{
-				MimeType:    webrtc.MimeTypeVP9,
-				ClockRate:   90000,
-				SDPFmtpLine: "profile-id=0",
-			},
-		}
-
-		encoder := &rtpvp9.Encoder{
-			PayloadType:      96,
-			PayloadMaxSize:   webrtcPayloadMaxSize,
-			InitialPictureID: ptrOf(uint16(8445)),
-		}
-		err := encoder.Init()
-		if err != nil {
-			return nil, err
-		}
-
-		r.OnData(
-			media,
-			vp9Format,
-			func(u *unit.Unit) error {
-				if u.NilPayload() {
-					return nil
-				}
-
-				packets, err2 := encoder.Encode(u.Payload.(unit.PayloadVP9))
-				if err2 != nil {
-					return nil //nolint:nilerr
-				}
-
-				for _, pkt := range packets {
-					ntp := u.NTP.Add(timestampToDuration(int64(pkt.Timestamp), 90000))
-					pkt.Timestamp += u.RTPPackets[0].Timestamp
-					track.WriteRTPWithNTP(pkt, ntp) //nolint:errcheck
-				}
-
-				return nil
-			})
-
-		return track, nil
-	}
-
-	var vp8Format *format.VP8
-	media = desc.FindFormat(&vp8Format)
-
-	if vp8Format != nil { //nolint:dupl
-		track := &OutgoingTrack{
-			Caps: webrtc.RTPCodecCapability{
-				MimeType:  webrtc.MimeTypeVP8,
-				ClockRate: 90000,
-			},
-		}
-
-		encoder := &rtpvp8.Encoder{
-			PayloadType:    96,
-			PayloadMaxSize: webrtcPayloadMaxSize,
-		}
-		err := encoder.Init()
-		if err != nil {
-			return nil, err
-		}
-
-		r.OnData(
-			media,
-			vp8Format,
-			func(u *unit.Unit) error {
-				if u.NilPayload() {
-					return nil
-				}
-
-				packets, err2 := encoder.Encode(u.Payload.(unit.PayloadVP8))
-				if err2 != nil {
-					return nil //nolint:nilerr
-				}
-
-				for _, pkt := range packets {
-					ntp := u.NTP.Add(timestampToDuration(int64(pkt.Timestamp), 90000))
-					pkt.Timestamp += u.RTPPackets[0].Timestamp
-					track.WriteRTPWithNTP(pkt, ntp) //nolint:errcheck
-				}
-
-				return nil
-			})
-
-		return track, nil
-	}
-
-	var h265Format *format.H265
-	media = desc.FindFormat(&h265Format)
-
-	if h265Format != nil { //nolint:dupl
-		track := &OutgoingTrack{
-			Caps: webrtc.RTPCodecCapability{
-				MimeType:    webrtc.MimeTypeH265,
-				ClockRate:   90000,
-				SDPFmtpLine: "level-id=93;profile-id=1;tier-flag=0;tx-mode=SRST",
-			},
-		}
-
-		encoder := &rtph265.Encoder{
-			PayloadType:    96,
-			PayloadMaxSize: webrtcPayloadMaxSize,
-		}
-		err := encoder.Init()
-		if err != nil {
-			return nil, err
-		}
-
-		firstReceived := false
-		var lastPTS int64
-
-		r.OnData(
-			media,
-			h265Format,
-			func(u *unit.Unit) error {
-				if u.NilPayload() {
-					return nil
-				}
-
-				if !firstReceived {
-					firstReceived = true
-				} else if u.PTS < lastPTS {
-					return fmt.Errorf("WebRTC doesn't support H265 streams with B-frames")
-				}
-				lastPTS = u.PTS
-
-				packets, err2 := encoder.Encode(u.Payload.(unit.PayloadH265))
-				if err2 != nil {
-					return nil //nolint:nilerr
-				}
-
-				for _, pkt := range packets {
-					ntp := u.NTP.Add(timestampToDuration(int64(pkt.Timestamp), 90000))
-					pkt.Timestamp += u.RTPPackets[0].Timestamp
-					track.WriteRTPWithNTP(pkt, ntp) //nolint:errcheck
-				}
-
-				return nil
-			})
-
-		return track, nil
-	}
-
+) (*OutboundTrack, error) {
+	tracks, err := setupVideoTracks(desc, r)
+	if err != nil { return nil, err }
+	if len(tracks) > 0 { return tracks[0], nil }
 	return nil, nil
 }
-
 
 func setupAudioTrack(
 	desc *description.Session,
 	r *stream.Reader,
-) (*OutgoingTrack, error) {
+) (*OutboundTrack, error) {
 	var opusFormat *format.Opus
 	media := desc.FindFormat(&opusFormat)
 
@@ -658,7 +308,7 @@ func setupAudioTrack(
 			return nil, fmt.Errorf("unsupported channel count: %d", opusFormat.ChannelCount)
 		}
 
-		track := &OutgoingTrack{
+		track := &OutboundTrack{
 			Caps: caps,
 		}
 
@@ -699,7 +349,7 @@ func setupAudioTrack(
 	media = desc.FindFormat(&g722Format)
 
 	if g722Format != nil {
-		track := &OutgoingTrack{
+		track := &OutboundTrack{
 			Caps: webrtc.RTPCodecCapability{
 				MimeType:  webrtc.MimeTypeG722,
 				ClockRate: 8000,
@@ -774,7 +424,7 @@ func setupAudioTrack(
 			}
 		}
 
-		track := &OutgoingTrack{
+		track := &OutboundTrack{
 			Caps: caps,
 		}
 
@@ -887,7 +537,7 @@ func setupAudioTrack(
 			return nil, fmt.Errorf("unsupported channel count: %d", lpcmFormat.ChannelCount)
 		}
 
-		track := &OutgoingTrack{
+		track := &OutboundTrack{
 			Caps: webrtc.RTPCodecCapability{
 				MimeType:  mimeTypeL16,
 				ClockRate: uint32(lpcmFormat.ClockRate()),
@@ -948,12 +598,12 @@ func setupAudioTrack(
 func setupKLVDataChannel(
 	desc *description.Session,
 	r *stream.Reader,
-) (*OutgoingDataChannel, error) {
+) (*OutboundDataChannel, error) {
 	var klvFormat *format.KLV
 	media := desc.FindFormat(&klvFormat)
 
 	if klvFormat != nil {
-		dataChan := &OutgoingDataChannel{
+		dataChan := &OutboundDataChannel{
 			Label: "KLV",
 		}
 
@@ -988,11 +638,10 @@ func FromStream(
 		return err
 	}
 
-	// Layer selection: layerIndex >= 0 = manual (single track), -1 = ABR (all tracks)
 	if layerIndex >= 0 && layerIndex < len(videoTracks) {
-		pc.OutgoingTracks = append(pc.OutgoingTracks, videoTracks[layerIndex])
+		pc.OutboundTracks = append(pc.OutboundTracks, videoTracks[layerIndex])
 	} else {
-		pc.OutgoingTracks = append(pc.OutgoingTracks, videoTracks...)
+		pc.OutboundTracks = append(pc.OutboundTracks, videoTracks...)
 	}
 
 	audioTrack, err := setupAudioTrack(desc, r)
@@ -1001,7 +650,7 @@ func FromStream(
 	}
 
 	if audioTrack != nil {
-		pc.OutgoingTracks = append(pc.OutgoingTracks, audioTrack)
+		pc.OutboundTracks = append(pc.OutboundTracks, audioTrack)
 	}
 
 	klvDataChan, err := setupKLVDataChannel(desc, r)
@@ -1010,10 +659,10 @@ func FromStream(
 	}
 
 	if klvDataChan != nil {
-		pc.OutgoingDataChannels = append(pc.OutgoingDataChannels, klvDataChan)
+		pc.OutboundDataChannels = append(pc.OutboundDataChannels, klvDataChan)
 	}
 
-	if len(pc.OutgoingTracks) == 0 && len(pc.OutgoingDataChannels) == 0 {
+	if len(pc.OutboundTracks) == 0 && len(pc.OutboundDataChannels) == 0 {
 		return errNoSupportedCodecsFrom
 	}
 

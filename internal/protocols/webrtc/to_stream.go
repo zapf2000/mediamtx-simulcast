@@ -38,26 +38,21 @@ func ToStream(
 	log logger.Writer,
 ) ([]*description.Media, error) {
 	var medias []*description.Media //nolint:prealloc
-
-	// Sort incoming tracks by RID ascending (rid "0" = highest quality in OBS simulcast)
-	// This ensures the first video media is always the best quality for downstream consumers.
-	incomingTracks := pc.IncomingTracks()
-	slices.SortStableFunc(incomingTracks, func(a, b *IncomingTrack) int {
-		ridA, ridB := a.RID(), b.RID()
-		// Both have RID: sort numerically/lexicographically ascending (0 < 1 < 2)
-		if ridA != "" && ridB != "" {
-			if ridA < ridB { return -1 }
-			if ridA > ridB { return 1 }
-			return 0
-		}
-		// No RID: keep original order
-		return 0
-	})
-
 	timeDecoder := &rtptime.GlobalDecoder{}
 	timeDecoder.Initialize()
 
-	for _, track := range pc.incomingTracks {
+	// Sort inbound tracks by RID ascending (rid:0 = highest quality)
+	inboundTracks := make([]*InboundTrack, len(pc.inboundTracks))
+	copy(inboundTracks, pc.inboundTracks)
+	slices.SortStableFunc(inboundTracks, func(a, b *InboundTrack) int {
+		ra, rb := a.RID(), b.RID()
+		if ra != "" && rb != "" {
+			if ra < rb { return -1 }
+			if ra > rb { return 1 }
+		}
+		return 0
+	})
+	for _, track := range inboundTracks {
 		var typ description.MediaType
 		var forma format.Format
 
