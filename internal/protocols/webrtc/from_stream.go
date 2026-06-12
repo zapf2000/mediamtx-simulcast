@@ -14,6 +14,7 @@ import (
 	"github.com/bluenviron/gortsplib/v5/pkg/format/rtpav1"
 	"github.com/bluenviron/gortsplib/v5/pkg/format/rtph264"
 	"github.com/bluenviron/gortsplib/v5/pkg/format/rtph265"
+	"github.com/bluenviron/gortsplib/v5/pkg/format/rtpvp8"
 	"github.com/bluenviron/gortsplib/v5/pkg/format/rtplpcm"
 	"github.com/bluenviron/gortsplib/v5/pkg/format/rtpvp9"
 	"github.com/bluenviron/mediacommon/v2/pkg/codecs/g711"
@@ -259,17 +260,266 @@ func buildVP9Track(media *description.Media, r *stream.Reader) (*OutboundTrack, 
 	})
 	return track, nil
 }
-
-// setupVideoTrack: original single-track behavior (fallback for non-simulcast)
 func setupVideoTrack(
 	desc *description.Session,
 	r *stream.Reader,
 ) (*OutboundTrack, error) {
-	tracks, err := setupVideoTracks(desc, r)
-	if err != nil { return nil, err }
-	if len(tracks) > 0 { return tracks[0], nil }
+	var av1Format *format.AV1
+	media := desc.FindFormat(&av1Format)
+
+	if av1Format != nil { //nolint:dupl
+		track := &OutboundTrack{
+			Caps: webrtc.RTPCodecCapability{
+				MimeType:  webrtc.MimeTypeAV1,
+				ClockRate: 90000,
+			},
+		}
+
+		encoder := &rtpav1.Encoder{
+			PayloadType:    105,
+			PayloadMaxSize: webrtcPayloadMaxSize,
+		}
+		err := encoder.Init()
+		if err != nil {
+			return nil, err
+		}
+
+		r.OnData(
+			media,
+			av1Format,
+			func(u *unit.Unit) error {
+				if u.NilPayload() {
+					return nil
+				}
+
+				packets, err2 := encoder.Encode(u.Payload.(unit.PayloadAV1))
+				if err2 != nil {
+					return nil //nolint:nilerr
+				}
+
+				for _, pkt := range packets {
+					ntp := u.NTP.Add(timestampToDuration(int64(pkt.Timestamp), 90000))
+					pkt.Timestamp += u.RTPPackets[0].Timestamp
+					track.WriteRTPWithNTP(pkt, ntp) //nolint:errcheck
+				}
+
+				return nil
+			})
+
+		return track, nil
+	}
+
+	var vp9Format *format.VP9
+	media = desc.FindFormat(&vp9Format)
+
+	if vp9Format != nil {
+		track := &OutboundTrack{
+			Caps: webrtc.RTPCodecCapability{
+				MimeType:    webrtc.MimeTypeVP9,
+				ClockRate:   90000,
+				SDPFmtpLine: "profile-id=0",
+			},
+		}
+
+		encoder := &rtpvp9.Encoder{
+			PayloadType:      96,
+			PayloadMaxSize:   webrtcPayloadMaxSize,
+			InitialPictureID: new(uint16(8445)),
+		}
+		err := encoder.Init()
+		if err != nil {
+			return nil, err
+		}
+
+		r.OnData(
+			media,
+			vp9Format,
+			func(u *unit.Unit) error {
+				if u.NilPayload() {
+					return nil
+				}
+
+				packets, err2 := encoder.Encode(u.Payload.(unit.PayloadVP9))
+				if err2 != nil {
+					return nil //nolint:nilerr
+				}
+
+				for _, pkt := range packets {
+					ntp := u.NTP.Add(timestampToDuration(int64(pkt.Timestamp), 90000))
+					pkt.Timestamp += u.RTPPackets[0].Timestamp
+					track.WriteRTPWithNTP(pkt, ntp) //nolint:errcheck
+				}
+
+				return nil
+			})
+
+		return track, nil
+	}
+
+	var vp8Format *format.VP8
+	media = desc.FindFormat(&vp8Format)
+
+	if vp8Format != nil { //nolint:dupl
+		track := &OutboundTrack{
+			Caps: webrtc.RTPCodecCapability{
+				MimeType:  webrtc.MimeTypeVP8,
+				ClockRate: 90000,
+			},
+		}
+
+		encoder := &rtpvp8.Encoder{
+			PayloadType:    96,
+			PayloadMaxSize: webrtcPayloadMaxSize,
+		}
+		err := encoder.Init()
+		if err != nil {
+			return nil, err
+		}
+
+		r.OnData(
+			media,
+			vp8Format,
+			func(u *unit.Unit) error {
+				if u.NilPayload() {
+					return nil
+				}
+
+				packets, err2 := encoder.Encode(u.Payload.(unit.PayloadVP8))
+				if err2 != nil {
+					return nil //nolint:nilerr
+				}
+
+				for _, pkt := range packets {
+					ntp := u.NTP.Add(timestampToDuration(int64(pkt.Timestamp), 90000))
+					pkt.Timestamp += u.RTPPackets[0].Timestamp
+					track.WriteRTPWithNTP(pkt, ntp) //nolint:errcheck
+				}
+
+				return nil
+			})
+
+		return track, nil
+	}
+
+	var h265Format *format.H265
+	media = desc.FindFormat(&h265Format)
+
+	if h265Format != nil { //nolint:dupl
+		track := &OutboundTrack{
+			Caps: webrtc.RTPCodecCapability{
+				MimeType:    webrtc.MimeTypeH265,
+				ClockRate:   90000,
+				SDPFmtpLine: "level-id=93;profile-id=1;tier-flag=0;tx-mode=SRST",
+			},
+		}
+
+		encoder := &rtph265.Encoder{
+			PayloadType:    96,
+			PayloadMaxSize: webrtcPayloadMaxSize,
+		}
+		err := encoder.Init()
+		if err != nil {
+			return nil, err
+		}
+
+		firstReceived := false
+		var lastPTS int64
+
+		r.OnData(
+			media,
+			h265Format,
+			func(u *unit.Unit) error {
+				if u.NilPayload() {
+					return nil
+				}
+
+				if !firstReceived {
+					firstReceived = true
+				} else if u.PTS < lastPTS {
+					return fmt.Errorf("WebRTC doesn't support H265 streams with B-frames")
+				}
+				lastPTS = u.PTS
+
+				packets, err2 := encoder.Encode(u.Payload.(unit.PayloadH265))
+				if err2 != nil {
+					return nil //nolint:nilerr
+				}
+
+				for _, pkt := range packets {
+					ntp := u.NTP.Add(timestampToDuration(int64(pkt.Timestamp), 90000))
+					pkt.Timestamp += u.RTPPackets[0].Timestamp
+					track.WriteRTPWithNTP(pkt, ntp) //nolint:errcheck
+				}
+
+				return nil
+			})
+
+		return track, nil
+	}
+
+	var h264Format *format.H264
+	media = desc.FindFormat(&h264Format)
+
+	if h264Format != nil { //nolint:dupl
+		track := &OutboundTrack{
+			Caps: webrtc.RTPCodecCapability{
+				MimeType:    webrtc.MimeTypeH264,
+				ClockRate:   90000,
+				SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
+			},
+		}
+
+		encoder := &rtph264.Encoder{
+			PayloadType:       96,
+			PayloadMaxSize:    webrtcPayloadMaxSize,
+			PacketizationMode: 1,
+		}
+		err := encoder.Init()
+		if err != nil {
+			return nil, err
+		}
+
+		firstReceived := false
+		var lastPTS int64
+
+		r.OnData(
+			media,
+			h264Format,
+			func(u *unit.Unit) error {
+				if u.NilPayload() {
+					return nil
+				}
+
+				if !firstReceived {
+					firstReceived = true
+				} else if u.PTS < lastPTS {
+					return fmt.Errorf("WebRTC doesn't support H264 streams with B-frames")
+				}
+				lastPTS = u.PTS
+
+				packets, err2 := encoder.Encode(u.Payload.(unit.PayloadH264))
+				if err2 != nil {
+					return nil //nolint:nilerr
+				}
+
+				for _, pkt := range packets {
+					ntp := u.NTP.Add(timestampToDuration(int64(pkt.Timestamp), 90000))
+					pkt.Timestamp += u.RTPPackets[0].Timestamp
+					track.WriteRTPWithNTP(pkt, ntp) //nolint:errcheck
+				}
+
+				return nil
+			})
+
+		return track, nil
+	}
+
 	return nil, nil
 }
+
+
+
+
 
 func setupAudioTrack(
 	desc *description.Session,
