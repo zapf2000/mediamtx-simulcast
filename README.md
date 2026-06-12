@@ -8,7 +8,7 @@ Patches [mediamtx](https://github.com/bluenviron/mediamtx) to forward all WebRTC
 - Layer menu (HIGH / MED / LOW) with live bitrate and resolution display
 - **ABR auto-switching** based on packet loss — instant switching, no reconnect
 - **Manual layer selection** — reconnects with `?layer=N`, server sends only that track (saves bandwidth)
-- Tracks automatically sorted by resolution (highest quality first) — important for downstream transcoders
+- Tracks automatically sorted by resolution (highest quality first)
 - Play-on-demand: no stream data until Play is pressed
 - Pause closes the WHEP connection entirely (zero bandwidth)
 - RTT and estimated one-way latency in HUD
@@ -77,11 +77,11 @@ Switches **up** when: packet loss < 1% sustained for 45 seconds
 
 ### Server-Side Layer Filtering
 
-When `?layer=N` is present in the WHEP URL, mediamtx only sends the Nth video track to the client. Unselected tracks are registered but discarded via a nil guard — no RTP packets are forwarded for them.
+When `?layer=N` is present in the WHEP URL, mediamtx only sends the Nth video track to the client. Unselected tracks are registered but discarded — no RTP packets are forwarded for them.
 
 ### Track Ordering
 
-Incoming simulcast tracks are sorted by RID (`rid:0` = highest quality in OBS). If SPS data is available, tracks are additionally sorted by decoded resolution. This ensures index 0 is always the best quality — important for downstream transcoders that pick the first track.
+Incoming simulcast tracks are sorted by RID (`rid:0` = highest quality in OBS). If SPS data is available, tracks are additionally sorted by decoded resolution.
 
 ## Changed Files
 
@@ -111,7 +111,7 @@ OBS on Linux uses **libdatachannel** instead of libwebrtc. Several fixes were re
 
 | Codec | Publisher | Notes |
 |---|---|---|
-| H264 | OBS 30+ | Fully tested |
+| H264 | OBS 30+, Browser | Fully tested |
 | H265 | OBS 31+ | HEVC simulcast |
 | AV1 | OBS 31+ with SVT-AV1 | Requires capable hardware |
 | VP9 | GStreamer / FFmpeg | OBS doesn't natively simulcast VP9 |
@@ -119,7 +119,23 @@ OBS on Linux uses **libdatachannel** instead of libwebrtc. Several fixes were re
 ## Pinned Dependencies
 
 ```
-github.com/pion/dtls/v3  v3.1.4   — fixes DTLS interop regression
+github.com/pion/dtls/v3   v3.1.4   — fixes DTLS interop regression
 github.com/pion/webrtc/v4 v4.2.15
-github.com/pion/ice/v4   v4.2.7
+github.com/pion/ice/v4    v4.2.7
 ```
+
+## Known Issues / Troubleshooting
+
+**Stack overflow crash when a WebRTC client connects while a non-simulcast stream is active (e.g. MoQ)**
+
+Cause: `setupVideoTracks` calls `setupVideoTrack` as a fallback for single-track streams. If `setupVideoTrack` is accidentally replaced with a stub that calls `setupVideoTracks` again, this creates infinite recursion.
+
+Fix: `setupVideoTrack` (without `s`) must contain the original first-match logic (AV1 → VP9 → VP8 → H265 → H264). It must **not** call `setupVideoTracks`. This is correctly implemented in the patched files in this repo.
+
+**OBS Linux: "No connection to server"**
+
+Make sure the `Accept-Patch` header is removed from the WHIP 201 response (already done in the patched `http_server.go`). Also verify `pion/dtls v3.1.4` is used — v3.1.3 was retracted due to broken DTLS interoperability with libdatachannel.
+
+**Browser player stuck at "Connecting"**
+
+Check browser console for JavaScript errors. The player requires template literal support (all modern browsers). Make sure `read_index.html` is the patched version from this repo (40+ KB), not the original mediamtx version (~4 KB).
