@@ -87,6 +87,9 @@ func tracksToCatalog(tracks []*moq.Track) (catalog.Catalog, error) {
 			Samplerate: track.Samplerate,
 			Channels:   track.Channels,
 			InitData:   track.InitData,
+			Width:      track.Width,
+			Height:     track.Height,
+			Bitrate:    track.Bitrate,
 		}
 		cat.Tracks[i] = ct
 	}
