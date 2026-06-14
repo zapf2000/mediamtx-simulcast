@@ -71,9 +71,6 @@ class MediaMTXMoQReader {
   #selectedLayer = 0;  // layer index to subscribe on connect
   #currentVideoLayer = 0;  // currently decoded layer
   #videoTrackAliases = [];  // request IDs per video layer
-  #switchingLayer = false;
-  #waitingForKeyframe = false;
-  #pendingLayer = -1;
   #videoParams = null;
   #videoCanvas = null;
   #videoDecoder = null;
@@ -82,6 +79,16 @@ class MediaMTXMoQReader {
   #audioCtx = null;
   #audioDecoder = null;
   #audioReorderer = null;
+  #videoWidth = 0;
+  #videoHeight = 0;
+  #layerBytes = [];
+  #switchingLayer = false;
+  #waitingForKeyframe = false;
+  #pendingLayer = -1;
+  #frameCount = 0;
+  #bytesReceived = 0;
+  #statsTimer = null;
+  #audioGain = null;
 
   /**
    * Create a MediaMTXMoQReader.
@@ -120,9 +127,31 @@ class MediaMTXMoQReader {
   selectLayer(index) {
     if (index < 0 || index >= this.#videoTracks.length) return;
     if (index === this.#currentVideoLayer) return;
-    // Don't switch immediately - wait for keyframe of new layer
-    this.#pendingLayer = index;
+    this.#currentVideoLayer = index;
     this.#selectedLayer = index;
+    // Null decoder first so in-flight frames are discarded by null-guard
+    if (this.#videoDecoder !== null) {
+      try { this.#videoDecoder.close(); } catch(e) {}
+      this.#videoDecoder = null;
+    }
+    // Small delay to let in-flight decode calls complete before new decoder
+    setTimeout(() => {
+      if (this.#state === "running") {
+        this.#setupVideoDecoder(this.#videoTracks[this.#currentVideoLayer]);
+        if (this.#conf.onLayerChanged !== undefined) {
+          this.#conf.onLayerChanged(this.#currentVideoLayer);
+        }
+      }
+    }, 50);
+  }
+
+  /**
+   * Set audio volume (0.0 - 1.0).
+   */
+  setVolume(v) {
+    if (this.#audioGain !== null) {
+      this.#audioGain.gain.value = Math.max(0, Math.min(1, v));
+    }
   }
 
   #start() {
@@ -167,6 +196,7 @@ class MediaMTXMoQReader {
       if (this.#audioCtx !== null) {
         this.#audioCtx.close();
         this.#audioCtx = null;
+        this.#audioGain = null;
       }
 
       this.#uniStreamsQueue = [];
@@ -623,6 +653,11 @@ class MediaMTXMoQReader {
 
     this.#videoDecoder = new VideoDecoder({
       output: (frame) => {
+        this.#frameCount++;
+        if (this.#videoWidth !== frame.displayWidth || this.#videoHeight !== frame.displayHeight) {
+          this.#videoWidth = frame.displayWidth;
+          this.#videoHeight = frame.displayHeight;
+        }
         try {
           if (ctxGL !== null) {
             this.#videoCanvas.width = frame.displayWidth;
@@ -645,6 +680,29 @@ class MediaMTXMoQReader {
 
     this.#videoTrack = track;
     this.#waitingForKeyframe = true;
+    this.#frameCount = 0;
+    this.#bytesReceived = 0;
+    if (this.#statsTimer !== null) clearInterval(this.#statsTimer);
+    this.#statsTimer = setInterval(() => {
+      const fps = this.#frameCount;
+      const bitrate = Math.round(this.#bytesReceived * 8 / 1000);
+      this.#frameCount = 0;
+      this.#bytesReceived = 0;
+      if (this.#conf.onStats !== undefined) {
+        const layerBitrates = this.#layerBytes.map(b => Math.round((b||0) * 8 / 1000)); this.#layerBytes = new Array(this.#videoTracks.length).fill(0); this.#conf.onStats({ fps, bitrate, layerBitrates, layer: this.#currentVideoLayer, width: this.#videoWidth, height: this.#videoHeight });
+      }
+    }, 1000);
+    this.#frameCount = 0;
+    if (this.#statsTimer !== null) { clearInterval(this.#statsTimer); }
+    this.#statsTimer = setInterval(() => {
+      const fps = this.#frameCount;
+      this.#frameCount = 0;
+      const bitrate = Math.round(this.#bytesReceived * 8 / 1000);
+      this.#bytesReceived = 0;
+      if (this.#conf.onStats !== undefined) {
+        const layerBitrates = this.#layerBytes.map(b => Math.round((b||0) * 8 / 1000)); this.#layerBytes = new Array(this.#videoTracks.length).fill(0); this.#conf.onStats({ fps, bitrate, layerBitrates, layer: this.#currentVideoLayer, width: this.#videoWidth, height: this.#videoHeight });
+      }
+    }, 1000);
   }
 
   async #subscribeTrack(requestId, track) {
@@ -815,6 +873,10 @@ class MediaMTXMoQReader {
       );
     } else {
       this.#audioCtx = new AudioContext();
+      this.#audioGain = this.#audioCtx.createGain();
+      this.#audioGain.connect(this.#audioCtx.destination);
+      this.#audioGain = this.#audioCtx.createGain();
+      this.#audioGain.connect(this.#audioCtx.destination);
 
       if (
         this.#audioCtx.state === "suspended" &&
@@ -844,7 +906,7 @@ class MediaMTXMoQReader {
 
               const src = this.#audioCtx.createBufferSource();
               src.buffer = buf;
-              src.connect(this.#audioCtx.destination);
+              src.connect(this.#audioGain !== null ? this.#audioGain : this.#audioCtx.destination);
 
               if (
                 playbackTime === null ||
@@ -919,37 +981,13 @@ class MediaMTXMoQReader {
       : trackAlias === MediaMTXMoQReader.#VIDEO_REQUEST_ID;
 
     if (isVideoAlias) {
-      // Check if a pending layer switch should happen on next keyframe from new layer
-      if (this.#pendingLayer >= 0 && trackAlias === this.#videoTrackAliases[this.#pendingLayer]) {
-        // This is data from the pending new layer - check for keyframe
-        let isKeyframe = false;
-        const codec = this.#videoTracks[this.#pendingLayer]?.codec || "";
-        if (/^avc3/.test(codec)) {
-          for (const nalu of MediaMTXMoQReader.#splitAVCC(data)) {
-            if ((nalu[0] & 0x1f) === 7) { isKeyframe = true; break; }
-          }
-        } else if (/^hev1/.test(codec)) {
-          for (const nalu of MediaMTXMoQReader.#splitAVCC(data)) {
-            if ((nalu[0] & 0x7e) >> 1 === 32) { isKeyframe = true; break; }
-          }
-        } else {
-          isKeyframe = true;
-        }
-        if (isKeyframe) {
-          // Switch now! Set up new decoder and decode this frame
-          const newLayer = this.#pendingLayer;
-          this.#pendingLayer = -1;
-          this.#currentVideoLayer = newLayer;
-          this.#setupVideoDecoder(this.#videoTracks[newLayer]);
-          this.#waitingForKeyframe = false;
-          // Decode this keyframe immediately
-          this.#decodeVideo(data, groupId);
-          if (this.#conf.onLayerChanged !== undefined) {
-            this.#conf.onLayerChanged(newLayer);
-          }
-        }
-        // else: not a keyframe yet, discard and keep current layer running
-      } else if (trackAlias === activeVideoAlias && this.#videoReorderer !== null && this.#videoDecoder !== null) {
+      if (trackAlias === activeVideoAlias) this.#bytesReceived += data.length;
+      const layerIdx = this.#videoTrackAliases.indexOf(trackAlias);
+      if (layerIdx >= 0) {
+        if (this.#layerBytes.length <= layerIdx) this.#layerBytes.length = layerIdx + 1;
+        this.#layerBytes[layerIdx] = (this.#layerBytes[layerIdx] || 0) + data.length;
+      }
+      if (trackAlias === activeVideoAlias && this.#videoReorderer !== null && this.#videoDecoder !== null) {
         const sgs = this.#videoReorderer.push(data, groupId);
         for (const sg of sgs) {
           this.#decodeVideo(sg.data, sg.groupId);

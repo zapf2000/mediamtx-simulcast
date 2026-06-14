@@ -265,8 +265,8 @@ class MediaMTXMoQPublisher {
           isLive: true,
           codec: this.#conf.videoCodec,
           clockrate: 90000,
-          width: layer.width,
-          height: layer.height,
+          width: parseInt(layer.width) || 0,
+          height: parseInt(layer.height) || 0,
         });
         trackIdx++;
       }
@@ -291,6 +291,7 @@ class MediaMTXMoQPublisher {
 
   async #publishAllTracks() {
     const catalog = this.#buildCatalog();
+    console.log("catalog JSON:", JSON.stringify(catalog));
     const catalogJSON = JSON.stringify(catalog);
     console.log("catalog:", catalog);
 
